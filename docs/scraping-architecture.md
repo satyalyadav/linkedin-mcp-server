@@ -82,6 +82,7 @@ a page-owning collaborator.
 - `get_page_text`
 - `get_saved_jobs`
 - `get_sidebar_profiles`
+- `save_job`
 - `scrape_company`
 - `scrape_job`
 - `scrape_person`
@@ -91,6 +92,7 @@ a page-owning collaborator.
 - `search_people`
 - `search_posts`
 - `send_message`
+- `unsave_job`
 
 ## `LinkedInExtractor` construction-state allowlist
 

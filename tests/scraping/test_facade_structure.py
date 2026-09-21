@@ -41,6 +41,7 @@ PUBLIC_SIGNATURES = {
     "get_page_text": "(self) -> 'str'",
     "get_saved_jobs": "(self, max_pages: 'int' = 3) -> 'dict[str, Any]'",
     "get_sidebar_profiles": "(self, username: 'str') -> 'dict[str, Any]'",
+    "save_job": "(self, job_id: 'str') -> 'dict[str, Any]'",
     "scrape_company": "(self, company_name: 'str', requested: 'set[str]', callbacks: 'ProgressCallback | None' = None) -> 'dict[str, Any]'",
     "scrape_job": "(self, job_id: 'str') -> 'dict[str, Any]'",
     "scrape_person": "(self, username: 'str', requested: 'set[str]', callbacks: 'ProgressCallback | None' = None, max_scrolls: 'int | None' = None, *, main_profile_already_loaded: 'bool' = False, allow_self_alias: 'bool' = False) -> 'dict[str, Any]'",
@@ -50,6 +51,7 @@ PUBLIC_SIGNATURES = {
     "search_people": "(self, keywords: 'str', location: 'str | None' = None, network: 'list[str] | None' = None, current_company: 'str | None' = None) -> 'dict[str, Any]'",
     "search_posts": "(self, keywords: 'str', date_posted: 'str | None' = None, max_pages: 'int' = 3) -> 'dict[str, Any]'",
     "send_message": "(self, linkedin_username: 'str', message: 'str', *, confirm_send: 'bool', profile_urn: 'str | None' = None) -> 'dict[str, Any]'",
+    "unsave_job": "(self, job_id: 'str') -> 'dict[str, Any]'",
 }
 
 DELEGATES = {
@@ -64,6 +66,7 @@ DELEGATES = {
     "get_page_text": ("_content", "get_page_text"),
     "get_saved_jobs": ("_jobs", "get_saved_jobs"),
     "get_sidebar_profiles": ("_person", "get_sidebar_profiles"),
+    "save_job": ("_jobs", "save_job"),
     "scrape_company": ("_company", "scrape_company"),
     "scrape_job": ("_jobs", "scrape_job"),
     "scrape_person": ("_person", "scrape_person"),
@@ -73,6 +76,7 @@ DELEGATES = {
     "search_people": ("_person", "search_people"),
     "search_posts": ("_posts", "search_posts"),
     "send_message": ("_message_sender", "send_message"),
+    "unsave_job": ("_jobs", "unsave_job"),
 }
 
 DELEGATE_CALLS = {
@@ -87,6 +91,7 @@ DELEGATE_CALLS = {
     "get_page_text": "self._content.get_page_text()",
     "get_saved_jobs": "self._jobs.get_saved_jobs(max_pages)",
     "get_sidebar_profiles": "self._person.get_sidebar_profiles(username)",
+    "save_job": "self._jobs.save_job(job_id)",
     "scrape_company": "self._company.scrape_company(company_name, requested, callbacks)",
     "scrape_job": "self._jobs.scrape_job(job_id)",
     "scrape_person": "self._person.scrape_person(username, requested, callbacks, max_scrolls, main_profile_already_loaded=main_profile_already_loaded, allow_self_alias=allow_self_alias)",
@@ -96,6 +101,7 @@ DELEGATE_CALLS = {
     "search_people": "self._person.search_people(keywords, location=location, network=network, current_company=current_company)",
     "search_posts": "self._posts.search_posts(keywords, date_posted=date_posted, max_pages=max_pages)",
     "send_message": "self._message_sender.send_message(linkedin_username, message, confirm_send=confirm_send, profile_urn=profile_urn)",
+    "unsave_job": "self._jobs.unsave_job(job_id)",
 }
 
 FACADE_STATE = {
