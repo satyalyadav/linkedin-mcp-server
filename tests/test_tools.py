@@ -3,7 +3,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastmcp import FastMCP
-from fastmcp.tools import FunctionTool
+from fastmcp.tools import FunctionTool, ToolResult
+from mcp.types import TextContent
 
 from linkedin_mcp_server.callbacks import MCPContextProgressCallback
 from linkedin_mcp_server.scraping.extractor import ExtractedSection, _RATE_LIMITED_MSG
@@ -26,6 +27,9 @@ def _make_mock_extractor(scrape_result: dict) -> MagicMock:
     mock.connect_with_person = AsyncMock(return_value=scrape_result)
     mock.scrape_company = AsyncMock(return_value=scrape_result)
     mock.scrape_job = AsyncMock(return_value=scrape_result)
+    mock.save_job = AsyncMock(return_value=scrape_result)
+    mock.unsave_job = AsyncMock(return_value=scrape_result)
+    mock.list_saved_jobs = AsyncMock(return_value=scrape_result)
     mock.search_jobs = AsyncMock(return_value=scrape_result)
     mock.search_people = AsyncMock(return_value=scrape_result)
     mock.get_sidebar_profiles = AsyncMock(return_value=scrape_result)
@@ -571,6 +575,74 @@ class TestCompanyTools:
 
 
 class TestJobTools:
+    async def test_save_job(self, mock_context):
+        expected = {
+            "url": "https://www.linkedin.com/jobs/view/12345/",
+            "job_id": "12345",
+            "saved": True,
+            "already_saved": False,
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.job import register_job_tools
+
+        mcp = FastMCP("test")
+        register_job_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "save_job")
+        result = await tool_fn("12345", mock_context, extractor=mock_extractor)
+        assert result["saved"] is True
+        mock_extractor.save_job.assert_awaited_once_with("12345")
+
+    async def test_unsave_job(self, mock_context):
+        expected = {
+            "url": "https://www.linkedin.com/jobs/view/12345/",
+            "job_id": "12345",
+            "saved": False,
+            "already_unsaved": False,
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.job import register_job_tools
+
+        mcp = FastMCP("test")
+        register_job_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "unsave_job")
+        result = await tool_fn("12345", mock_context, extractor=mock_extractor)
+        assert result["saved"] is False
+        mock_extractor.unsave_job.assert_awaited_once_with("12345")
+
+    async def test_list_saved_jobs(self, mock_context):
+        expected = {
+            "url": "https://www.linkedin.com/my-items/saved-jobs/",
+            "sections": {"saved_jobs": "Saved jobs page text"},
+            "job_ids": ["111", "222"],
+            "jobs": [
+                {
+                    "job_id": "111",
+                    "job_url": "https://www.linkedin.com/jobs/view/111/",
+                    "card_text": "Job A",
+                },
+                {
+                    "job_id": "222",
+                    "job_url": "https://www.linkedin.com/jobs/view/222/",
+                    "card_text": "Job B",
+                },
+            ],
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.job import register_job_tools
+
+        mcp = FastMCP("test")
+        register_job_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "list_saved_jobs")
+        result = await tool_fn(mock_context, extractor=mock_extractor)
+        assert result["job_ids"] == ["111", "222"]
+        mock_extractor.list_saved_jobs.assert_awaited_once_with(max_scrolls=25)
+
     async def test_get_job_details(self, mock_context):
         expected = {
             "url": "https://www.linkedin.com/jobs/view/12345/",
@@ -1116,6 +1188,141 @@ class TestFeedTools:
         with pytest.raises(ValidationError, match="num_posts"):
             await mcp.call_tool("get_feed", {"num_posts": 51})
 
+    async def test_search_posts_success(self, mock_context):
+        mock_extractor = MagicMock()
+        mock_extractor.search_posts = AsyncMock(
+            return_value={
+                "url": "https://www.linkedin.com/search/results/content/?keywords=hiring",
+                "sections": {"search_results": "Post result"},
+                "references": {
+                    "search_results": [
+                        {
+                            "kind": "feed_post",
+                            "url": "/posts/alice_hiring-ugcPost-1-abc",
+                        }
+                    ]
+                },
+            }
+        )
+
+        from linkedin_mcp_server.tools.feed import register_feed_tools
+
+        mcp = FastMCP("test")
+        register_feed_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "search_posts")
+        result = cast(
+            ToolResult,
+            await tool_fn(
+                "hiring",
+                mock_context,
+                date_posted="past_week",
+                sort_by="date_posted",
+                max_pages=2,
+                extractor=mock_extractor,
+            ),
+        )
+
+        assert result.structured_content is not None
+        assert result.structured_content["sections"]["search_results"] == "Post result"
+        assert isinstance(result.content[0], TextContent)
+        assert "Post search complete" in result.content[0].text
+        mock_extractor.search_posts.assert_awaited_once_with(
+            "hiring",
+            date_posted="past_week",
+            sort_by="date_posted",
+            max_pages=2,
+            include_raw=False,
+        )
+
+    async def test_search_posts_rejects_zero_max_pages(self, mock_context):
+        """Verify max_pages=0 is rejected by Field(ge=1) validation."""
+        from pydantic import ValidationError
+
+        from linkedin_mcp_server.tools.feed import register_feed_tools
+
+        mcp = FastMCP("test")
+        register_feed_tools(mcp)
+
+        with pytest.raises(ValidationError, match="max_pages"):
+            await mcp.call_tool("search_posts", {"keywords": "hiring", "max_pages": 0})
+
+    async def test_search_posts_accepts_deep_scroll_budget(self, mock_context):
+        """Post search allows deep scrolling for broad past-24-hour searches."""
+        expected = {
+            "url": "https://www.linkedin.com/search/results/content/?keywords=hiring",
+            "sections": {"search_results": "Post result"},
+        }
+        mock_extractor = MagicMock()
+        mock_extractor.search_posts = AsyncMock(return_value=expected)
+
+        from linkedin_mcp_server.tools.feed import register_feed_tools
+
+        mcp = FastMCP("test")
+        register_feed_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "search_posts")
+        await tool_fn("hiring", mock_context, max_pages=100, extractor=mock_extractor)
+
+        mock_extractor.search_posts.assert_awaited_once_with(
+            "hiring",
+            date_posted=None,
+            sort_by=None,
+            max_pages=100,
+            include_raw=False,
+        )
+
+    async def test_search_posts_can_include_raw_diagnostics(self, mock_context):
+        expected = {
+            "url": "https://www.linkedin.com/search/results/content/?keywords=hiring",
+            "sections": {"search_results": "Post result"},
+            "post_urls": [],
+            "posts": [],
+            "coverage": {"status": "stable_bottom_before_boundary"},
+        }
+        mock_extractor = MagicMock()
+        mock_extractor.search_posts = AsyncMock(return_value=expected)
+
+        from linkedin_mcp_server.tools.feed import register_feed_tools
+
+        mcp = FastMCP("test")
+        register_feed_tools(mcp)
+
+        tool_fn = await get_tool_fn(mcp, "search_posts")
+        result = cast(
+            ToolResult,
+            await tool_fn(
+                "hiring",
+                mock_context,
+                include_raw=True,
+                extractor=mock_extractor,
+            ),
+        )
+
+        assert result.structured_content is not None
+        assert result.structured_content["sections"]["search_results"] == "Post result"
+        mock_extractor.search_posts.assert_awaited_once_with(
+            "hiring",
+            date_posted=None,
+            sort_by=None,
+            max_pages=3,
+            include_raw=True,
+        )
+
+    async def test_search_posts_rejects_too_many_scrolls(self, mock_context):
+        """Keep an upper bound so accidental calls cannot scroll indefinitely."""
+        from pydantic import ValidationError
+
+        from linkedin_mcp_server.tools.feed import register_feed_tools
+
+        mcp = FastMCP("test")
+        register_feed_tools(mcp)
+
+        with pytest.raises(ValidationError, match="max_pages"):
+            await mcp.call_tool(
+                "search_posts", {"keywords": "hiring", "max_pages": 101}
+            )
+
 
 class TestToolTimeouts:
     async def test_all_tools_have_global_timeout(self):
@@ -1138,6 +1345,7 @@ class TestToolTimeouts:
             "search_conversations",
             "send_message",
             "get_feed",
+            "search_posts",
             "close_session",
         )
 
@@ -1169,6 +1377,7 @@ class TestToolTimeouts:
             "search_conversations",
             "send_message",
             "get_feed",
+            "search_posts",
             "close_session",
         )
 

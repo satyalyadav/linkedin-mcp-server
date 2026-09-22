@@ -17,6 +17,7 @@ from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
 from linkedin_mcp_server.core.exceptions import AuthenticationError
 from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_error
 from linkedin_mcp_server.error_handler import raise_tool_error
+from linkedin_mcp_server.response_cache import profile_result_cache
 from linkedin_mcp_server.scraping import parse_person_sections
 from linkedin_mcp_server.scraping.extractor import FilterValidationError
 
@@ -69,10 +70,18 @@ def register_person_tools(
             The LLM should parse the raw text in each section.
         """
         try:
+            use_cache = extractor is None
             extractor = extractor or await get_ready_extractor(
                 ctx, tool_name="get_person_profile"
             )
             requested, unknown = parse_person_sections(sections)
+            cache_key = (
+                "person",
+                linkedin_username.strip().casefold(),
+                tuple(sorted(requested)),
+                max_scrolls,
+            )
+            result = profile_result_cache.get(cache_key) if use_cache else None
 
             logger.info(
                 "Scraping profile: %s (sections=%s)",
@@ -80,13 +89,18 @@ def register_person_tools(
                 sections,
             )
 
-            cb = MCPContextProgressCallback(ctx)
-            result = await extractor.scrape_person(
-                linkedin_username,
-                requested,
-                callbacks=cb,
-                max_scrolls=max_scrolls,
-            )
+            if result is None:
+                cb = MCPContextProgressCallback(ctx)
+                result = await extractor.scrape_person(
+                    linkedin_username,
+                    requested,
+                    callbacks=cb,
+                    max_scrolls=max_scrolls,
+                )
+                if use_cache:
+                    profile_result_cache.set(cache_key, result)
+            else:
+                logger.info("Using cached profile: %s", linkedin_username)
 
             if unknown:
                 result["unknown_sections"] = unknown

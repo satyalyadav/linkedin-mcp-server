@@ -32,9 +32,11 @@ Through this LinkedIn MCP server, AI assistants like Claude can connect to your 
 | `search_companies` | Search for companies on LinkedIn by keywords | working |
 | `get_company_employees` | List employees at a company from the /people/ page, with optional keyword filter | working |
 | `search_jobs` | Search for jobs with keywords and location filters | working |
+| `unsave_job` | Remove a job from the authenticated user's saved jobs list | working |
 | `search_people` | Search for people by keywords, location, connection degree (1st/2nd/3rd), and current company | working |
 | `get_job_details` | Get detailed information about a specific job posting | working |
 | `get_feed` | Get recent posts from the authenticated user's home feed | working |
+| `search_posts` | Search LinkedIn posts/content with recency/sort filters, structured full-text cards, same-card permalink capture, automatic date-boundary stopping, and conservative coverage evidence. Returns a compact readable summary by default; set `include_raw=true` for diagnostic page text/references. | working |
 | `close_session` | Close browser session and clean up resources | working |
 
 <br/>

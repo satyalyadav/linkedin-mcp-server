@@ -25,6 +25,149 @@ def register_job_tools(
 
     @mcp.tool(
         timeout=tool_timeout,
+        title="Save Job",
+        annotations={"readOnlyHint": False, "openWorldHint": True},
+        tags={"job"},
+        exclude_args=["extractor"],
+    )
+    async def save_job(
+        job_id: str,
+        ctx: Context,
+        extractor: Any | None = None,
+    ) -> dict[str, Any]:
+        """
+        Save a LinkedIn job posting to the authenticated account's saved jobs list.
+
+        Args:
+            job_id: LinkedIn job ID (e.g., "4252026496", "3856789012")
+            ctx: FastMCP context for progress reporting
+
+        Returns:
+            Dict with url, job_id, saved, and already_saved status.
+        """
+        try:
+            extractor = extractor or await get_ready_extractor(
+                ctx, tool_name="save_job"
+            )
+            logger.info("Saving job: %s", job_id)
+
+            await ctx.report_progress(progress=0, total=100, message="Opening job")
+
+            result = await extractor.save_job(job_id)
+
+            await ctx.report_progress(progress=100, total=100, message="Complete")
+
+            return result
+
+        except AuthenticationError as e:
+            try:
+                await handle_auth_error(e, ctx)
+            except Exception as relogin_exc:
+                raise_tool_error(relogin_exc, "save_job")
+        except Exception as e:
+            raise_tool_error(e, "save_job")  # NoReturn
+
+    @mcp.tool(
+        timeout=tool_timeout,
+        title="Unsave Job",
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "openWorldHint": True,
+        },
+        tags={"job"},
+        exclude_args=["extractor"],
+    )
+    async def unsave_job(
+        job_id: str,
+        ctx: Context,
+        extractor: Any | None = None,
+    ) -> dict[str, Any]:
+        """Remove a LinkedIn job posting from the saved jobs list.
+
+        Args:
+            job_id: LinkedIn job ID (e.g., "4252026496", "3856789012")
+            ctx: FastMCP context for progress reporting
+
+        Returns:
+            Dict with url, job_id, saved, and already_unsaved status.
+        """
+        try:
+            extractor = extractor or await get_ready_extractor(
+                ctx, tool_name="unsave_job"
+            )
+            logger.info("Unsaving job: %s", job_id)
+
+            await ctx.report_progress(progress=0, total=100, message="Opening job")
+
+            result = await extractor.unsave_job(job_id)
+
+            await ctx.report_progress(progress=100, total=100, message="Complete")
+
+            return result
+
+        except AuthenticationError as e:
+            try:
+                await handle_auth_error(e, ctx)
+            except Exception as relogin_exc:
+                raise_tool_error(relogin_exc, "unsave_job")
+        except Exception as e:
+            raise_tool_error(e, "unsave_job")  # NoReturn
+
+    @mcp.tool(
+        timeout=tool_timeout,
+        title="List Saved Jobs",
+        annotations={"readOnlyHint": True, "openWorldHint": True},
+        tags={"job"},
+        exclude_args=["extractor"],
+    )
+    async def list_saved_jobs(
+        ctx: Context,
+        max_scrolls: Annotated[int, Field(ge=1, le=100)] = 25,
+        extractor: Any | None = None,
+    ) -> dict[str, Any]:
+        """
+        List the jobs saved by the authenticated account.
+
+        Navigates to the account's saved-jobs page and scrolls until no
+        new jobs appear, so the full saved list is captured. Merges card
+        snapshots by job ID so lazily loaded or virtualized cards are kept.
+
+        Args:
+            ctx: FastMCP context for progress reporting
+            max_scrolls: Maximum scroll attempts (1-100, default 25)
+
+        Returns:
+            Dict with url, sections (saved_jobs -> raw text), job_ids, and
+            jobs: [{job_id, job_url, card_text}] in list order. job_ids can
+            be passed to get_job_details, unsave_job, and save_job.
+        """
+        try:
+            extractor = extractor or await get_ready_extractor(
+                ctx, tool_name="list_saved_jobs"
+            )
+            logger.info("Listing saved jobs (max_scrolls=%d)", max_scrolls)
+
+            await ctx.report_progress(
+                progress=0, total=100, message="Opening saved jobs page"
+            )
+
+            result = await extractor.list_saved_jobs(max_scrolls=max_scrolls)
+
+            await ctx.report_progress(progress=100, total=100, message="Complete")
+
+            return result
+
+        except AuthenticationError as e:
+            try:
+                await handle_auth_error(e, ctx)
+            except Exception as relogin_exc:
+                raise_tool_error(relogin_exc, "list_saved_jobs")
+        except Exception as e:
+            raise_tool_error(e, "list_saved_jobs")  # NoReturn
+
+    @mcp.tool(
+        timeout=tool_timeout,
         title="Get Job Details",
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"job", "scraping"},

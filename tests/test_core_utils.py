@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from linkedin_mcp_server.core.exceptions import RateLimitError
-from linkedin_mcp_server.core.utils import detect_rate_limit
+from linkedin_mcp_server.core.utils import detect_rate_limit, scroll_to_bottom
 
 
 @pytest.fixture
@@ -109,3 +109,139 @@ class TestDetectRateLimit:
 
         mock_page.locator = MagicMock(side_effect=locator_side_effect)
         await detect_rate_limit(mock_page)
+
+
+class TestScrollToBottom:
+    async def test_observer_can_stop_before_first_scroll(self, mock_page):
+        observer = AsyncMock(return_value="time_window_boundary")
+
+        result = await scroll_to_bottom(
+            mock_page,
+            pause_time=0,
+            max_scrolls=100,
+            observation_callback=observer,
+        )
+
+        assert result["attempts"] == 0
+        assert result["stop_reason"] == "time_window_boundary"
+        mock_page.evaluate.assert_not_called()
+
+    async def test_observer_can_stop_after_new_content(self, mock_page):
+        first = {
+            "scrollTop": 0,
+            "scrollHeight": 2500,
+            "clientHeight": 800,
+            "contentLength": 1000,
+            "contentTail": "new",
+        }
+        second = {**first, "scrollTop": 600, "contentLength": 2000}
+        mock_page.evaluate = AsyncMock(side_effect=[first, None, second])
+        observer = AsyncMock(side_effect=[None, "time_window_boundary"])
+
+        result = await scroll_to_bottom(
+            mock_page,
+            pause_time=0,
+            max_scrolls=100,
+            observation_callback=observer,
+        )
+
+        assert result["attempts"] == 1
+        assert result["stop_reason"] == "time_window_boundary"
+
+    async def test_scrolls_internal_linkedin_workspace_container(self, mock_page):
+        mock_page.evaluate = AsyncMock(
+            side_effect=[
+                {"scrollTop": 0, "scrollHeight": 2500, "clientHeight": 800},
+                None,
+                {"scrollTop": 600, "scrollHeight": 3200, "clientHeight": 800},
+                {"scrollTop": 600, "scrollHeight": 3200, "clientHeight": 800},
+                None,
+                {"scrollTop": 1200, "scrollHeight": 4200, "clientHeight": 800},
+            ]
+        )
+
+        result = await scroll_to_bottom(mock_page, pause_time=0, max_scrolls=2)
+
+        assert mock_page.evaluate.await_count == 6
+        scripts = "\n".join(call.args[0] for call in mock_page.evaluate.await_args_list)
+        assert "main#workspace" in scripts
+        assert "* 1.5" in scripts
+        assert "target.scrollBy(0, step)" in scripts
+        assert result["attempts"] == 2
+        assert result["stop_reason"] == "max_scrolls"
+
+    async def test_reports_stable_bottom(self, mock_page):
+        stable = {
+            "scrollTop": 1700,
+            "scrollHeight": 2500,
+            "clientHeight": 800,
+            "contentLength": 5000,
+            "contentTail": "last card",
+        }
+        mock_page.evaluate = AsyncMock(
+            side_effect=[stable, None, stable, stable, None, stable]
+        )
+
+        result = await scroll_to_bottom(
+            mock_page,
+            pause_time=0,
+            max_scrolls=10,
+            stale_limit=2,
+        )
+
+        assert result["attempts"] == 2
+        assert result["stop_reason"] == "stable_bottom"
+        assert result["stable_bottom_reached"] is True
+        assert result["explicit_end_marker_seen"] is False
+        assert result["end_reached"] is False
+
+    async def test_delayed_bottom_retry_observes_late_content(self, mock_page):
+        stable = {
+            "scrollTop": 1700,
+            "scrollHeight": 2500,
+            "clientHeight": 800,
+            "contentLength": 5000,
+            "contentTail": "last card",
+        }
+        grown = {
+            "scrollTop": 1700,
+            "scrollHeight": 3500,
+            "clientHeight": 800,
+            "contentLength": 6500,
+            "contentTail": "new card",
+        }
+        later = {
+            "scrollTop": 2600,
+            "scrollHeight": 4200,
+            "clientHeight": 800,
+            "contentLength": 7200,
+            "contentTail": "later card",
+        }
+        mock_page.evaluate = AsyncMock(
+            side_effect=[
+                stable,
+                None,
+                stable,
+                stable,
+                None,
+                stable,
+                grown,
+                grown,
+                None,
+                later,
+            ]
+        )
+
+        result = await scroll_to_bottom(
+            mock_page,
+            pause_time=0,
+            max_scrolls=3,
+            stale_limit=2,
+            bottom_retry_limit=1,
+            bottom_retry_pause=0,
+        )
+
+        assert result["attempts"] == 3
+        assert result["bottom_retries"] == 1
+        assert result["stop_reason"] == "max_scrolls"
+        assert result["stable_bottom_reached"] is False

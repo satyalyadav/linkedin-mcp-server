@@ -82,6 +82,10 @@
       "description": "Retrieve specific job posting details using LinkedIn job IDs"
     },
     {
+      "name": "unsave_job",
+      "description": "Remove a LinkedIn job posting from the authenticated user's saved jobs list"
+    },
+    {
       "name": "search_jobs",
       "description": "Search for jobs with filters like keywords and location"
     },

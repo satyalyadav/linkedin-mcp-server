@@ -31,6 +31,8 @@ Optional additional keys:
 - `section_errors: {section_name: {error_type, error_message, issue_template_path, runtime, ...}}`
 - `unknown_sections: [name, ...]`
 - `job_ids: [id, ...]` (search_jobs only)
+- `post_urls: [absolute_permalink, ...]` (search_posts only)
+- `posts: [{author, author_profile_url, headline, relative_time, age_hours, text, post_url, url_match}, ...]` and `coverage: {...}` (search_posts only) — structured cards use full returned text, prefer same-card DOM permalink/URN evidence, and use unique payload actor anchors for conservative ordered pairing. Date-sorted searches stop when their requested relative-time boundary is observed. Coverage distinguishes that boundary, a delayed-retry stable browser bottom, and an explicit end marker, and never guarantees LinkedIn indexing exhaustiveness. The MCP tool omits raw `sections`/`references` by default and returns a concise text summary plus structured records; use `include_raw=true` only for diagnostics.
 - `references["feed"]` (get_feed only) — every entry is `kind: "feed_post"`; non-post anchors (sidebar profiles, employer logos) are filtered. URLs may carry either `/feed/update/<urn>/` (DOM-anchor-derived) or `/posts/<slug>` (SDUI-derived) form; both are valid LinkedIn permalinks. Cap is 50 entries, matching `get_feed`'s `num_posts` ceiling.
 
 ## Verifying Bug Reports

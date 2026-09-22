@@ -95,6 +95,10 @@ _REFERENCE_CAPS = {
     "honors": 12,
     "languages": 12,
     "posts": 12,
+    # Content search can expose one permalink and one author/company per result.
+    # Deep content searches can exceed 200 links once max_pages reaches 100.
+    # Keep enough headroom for one post permalink plus author/page references.
+    "post_search_results": 500,
     "jobs": 8,
     "search_results": 15,
     "job_posting": 8,

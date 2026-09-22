@@ -15,6 +15,7 @@ from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
 from linkedin_mcp_server.core.exceptions import AuthenticationError
 from linkedin_mcp_server.dependencies import get_ready_extractor, handle_auth_error
 from linkedin_mcp_server.error_handler import raise_tool_error
+from linkedin_mcp_server.response_cache import profile_result_cache
 from linkedin_mcp_server.scraping import parse_company_sections
 from linkedin_mcp_server.scraping.extractor import _RATE_LIMITED_MSG
 from linkedin_mcp_server.scraping.link_metadata import Reference
@@ -66,10 +67,17 @@ def register_company_tools(
             that facet.
         """
         try:
+            use_cache = extractor is None
             extractor = extractor or await get_ready_extractor(
                 ctx, tool_name="get_company_profile"
             )
             requested, unknown = parse_company_sections(sections)
+            cache_key = (
+                "company",
+                company_name.strip().casefold(),
+                tuple(sorted(requested)),
+            )
+            result = profile_result_cache.get(cache_key) if use_cache else None
 
             logger.info(
                 "Scraping company: %s (sections=%s)",
@@ -77,10 +85,15 @@ def register_company_tools(
                 sections,
             )
 
-            cb = MCPContextProgressCallback(ctx)
-            result = await extractor.scrape_company(
-                company_name, requested, callbacks=cb
-            )
+            if result is None:
+                cb = MCPContextProgressCallback(ctx)
+                result = await extractor.scrape_company(
+                    company_name, requested, callbacks=cb
+                )
+                if use_cache:
+                    profile_result_cache.set(cache_key, result)
+            else:
+                logger.info("Using cached company profile: %s", company_name)
 
             if unknown:
                 result["unknown_sections"] = unknown

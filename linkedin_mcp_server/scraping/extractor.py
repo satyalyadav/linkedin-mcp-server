@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 import json
 import logging
@@ -88,6 +89,61 @@ _JOB_TYPE_MAP = {
 _WORK_TYPE_MAP = {"on_site": "1", "remote": "2", "hybrid": "3"}
 
 _SORT_BY_MAP = {"date": "DD", "relevance": "R"}
+
+# LinkedIn's job Save control currently exposes no locale-independent state
+# attribute: the same button changes its visible label from "Save" to "Saved".
+# Keep that unavoidable text dependency isolated in an explicit locale table.
+# BrowserManager forces en-US today; unsupported locales fail closed instead of
+# risking a click on the wrong job action.
+_JOB_SAVE_LABELS_BY_LOCALE = {
+    "en": {"saved": "Saved", "unsaved": "Save"},
+    "en-US": {"saved": "Saved", "unsaved": "Save"},
+}
+
+# LinkedIn's AI job-search route ignores some classic URL facets. These labels
+# preserve the requested filters by expressing them in the AI query itself.
+_AI_EXPERIENCE_LEVEL_MAP = {
+    "internship": "internship",
+    "entry": "entry level",
+    "associate": "associate level",
+    "mid_senior": "mid-senior level",
+    "director": "director level",
+    "executive": "executive level",
+}
+
+_AI_JOB_TYPE_MAP = {
+    "full_time": "full-time",
+    "part_time": "part-time",
+    "contract": "contract",
+    "temporary": "temporary",
+    "volunteer": "volunteer",
+    "internship": "internship",
+    "other": "other job type",
+}
+
+_AI_WORK_TYPE_MAP = {
+    "on_site": "on-site",
+    "remote": "remote",
+    "hybrid": "hybrid",
+}
+
+_AI_SORT_BY_MAP = {
+    "date": "sorted by most recent",
+    "relevance": "sorted by relevance",
+}
+
+# Normalization maps for LinkedIn content/post search filters.
+_CONTENT_DATE_POSTED_MAP = {
+    "past_24_hours": "past-24h",
+    "past_week": "past-week",
+    "past_month": "past-month",
+}
+
+_CONTENT_SORT_BY_MAP = {
+    "date": "date_posted",
+    "date_posted": "date_posted",
+    "relevance": "relevance",
+}
 
 # Valid tokens for the people-search ``network`` facet.
 # LinkedIn accepts "F" (1st-degree), "S" (2nd-degree), "O" (3rd-degree and beyond).
@@ -317,6 +373,7 @@ class ExtractedSection:
     text: str
     references: list[Reference]
     error: dict[str, Any] | None = None
+    metadata: dict[str, Any] | None = None
 
 
 _FEED_RSC_MARKER = "sduiid=com.linkedin.sdui.pagers.feed.mainFeed"
@@ -325,8 +382,19 @@ _FEED_RSC_MARKER = "sduiid=com.linkedin.sdui.pagers.feed.mainFeed"
 # while paginated responses use plain slashes). Captures the slug portion so
 # we can rebuild a canonical URL regardless of the source encoding.
 _POST_SLUG_URL_RE = re.compile(
-    r"linkedin\.com(?:\\u002[fF]|/)posts(?:\\u002[fF]|/)"
+    r"linkedin\.com(?:\\u002[fF]|\\/|/)posts(?:\\u002[fF]|\\/|/)"
     r"(?P<slug>[A-Za-z0-9_-]+?-(?:ugcPost|activity|share)-\d+-[A-Za-z0-9_-]+)"
+)
+_FEED_UPDATE_URL_RE = re.compile(
+    r"linkedin\.com(?:\\u002[fF]|\\/|/)feed(?:\\u002[fF]|\\/|/)update"
+    r"(?:\\u002[fF]|\\/|/)urn:li:activity:(?P<activity_id>\d+)"
+)
+_POST_ACTOR_NAME_RE = re.compile(
+    r'"actorName":"(?P<actor>(?:\\.|[^"\\])*)"',
+)
+_POST_ACTOR_PROFILE_URL_RE = re.compile(
+    r'"(?:actorNavigationUrl|actorProfileUrl|actorUrl)":'
+    r'"(?P<url>(?:\\.|[^"\\])*)"',
 )
 _FEED_DOCUMENT_URLS = {
     "https://www.linkedin.com/feed",
@@ -334,11 +402,618 @@ _FEED_DOCUMENT_URLS = {
 }
 
 
+def _is_linkedin_response_url(url: str) -> bool:
+    """Return whether *url* points at LinkedIn or one of its subdomains."""
+    host = urlparse(url).netloc.lower().split(":", 1)[0]
+    return host == "linkedin.com" or host.endswith(".linkedin.com")
+
+
 def _is_feed_payload_response(url: str) -> bool:
     """True if the response URL is one that carries `postSlugUrl` fields."""
     if _FEED_RSC_MARKER in url:
         return True
     return url.split("?", 1)[0] in _FEED_DOCUMENT_URLS
+
+
+def _is_post_search_payload_response(url: str) -> bool:
+    """True for LinkedIn responses that may carry content-search posts.
+
+    The initial search document can embed post permalinks in its RSC payload.
+    Lazy batches arrive through LinkedIn's Voyager or SDUI endpoints. Their
+    operation names are not stable, so the filter deliberately relies only on
+    the LinkedIn host and these durable endpoint families.
+    """
+    if not _is_linkedin_response_url(url):
+        return False
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    if path == "/search/results/content":
+        return True
+    return path.startswith("/voyager/api/") or "sdui" in url.lower()
+
+
+def _post_urls_from_payload(payload: str) -> list[str]:
+    """Extract canonical post permalinks from a LinkedIn response payload."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    for match in _POST_SLUG_URL_RE.finditer(payload):
+        url = f"https://www.linkedin.com/posts/{match.group('slug')}"
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    for match in _FEED_UPDATE_URL_RE.finditer(payload):
+        url = (
+            "https://www.linkedin.com/feed/update/urn:li:activity:"
+            f"{match.group('activity_id')}/"
+        )
+        if url not in seen:
+            seen.add(url)
+            urls.append(url)
+    return urls
+
+
+def _post_records_from_payload(payload: str) -> list[dict[str, str]]:
+    """Extract ordered permalink/actor pairs from LinkedIn search payloads."""
+    records: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for url_match in _POST_SLUG_URL_RE.finditer(payload):
+        post_url = f"https://www.linkedin.com/posts/{url_match.group('slug')}"
+        if post_url in seen:
+            continue
+        actor_matches = list(
+            _POST_ACTOR_NAME_RE.finditer(
+                payload,
+                max(0, url_match.start() - 1200),
+                url_match.start(),
+            )
+        )
+        if not actor_matches:
+            continue
+        raw_actor = actor_matches[-1].group("actor")
+        try:
+            actor_name = json.loads(f'"{raw_actor}"')
+        except json.JSONDecodeError:
+            actor_name = raw_actor
+        if not isinstance(actor_name, str) or not actor_name.strip():
+            continue
+        actor_profile_url: str | None = None
+        profile_matches = list(
+            _POST_ACTOR_PROFILE_URL_RE.finditer(
+                payload,
+                actor_matches[-1].start(),
+                url_match.start(),
+            )
+        )
+        if profile_matches:
+            raw_profile_url = profile_matches[-1].group("url")
+            try:
+                decoded_profile_url = json.loads(f'"{raw_profile_url}"')
+            except json.JSONDecodeError:
+                decoded_profile_url = raw_profile_url
+            if isinstance(decoded_profile_url, str):
+                parsed_profile = urlparse(decoded_profile_url)
+                profile_path = parsed_profile.path.rstrip("/")
+                profile_host = parsed_profile.netloc.lower().split(":", 1)[0]
+                if profile_host in {"linkedin.com", "www.linkedin.com"} and (
+                    profile_path.startswith("/in/")
+                    or profile_path.startswith("/company/")
+                ):
+                    actor_profile_url = f"https://www.linkedin.com{profile_path}/"
+        seen.add(post_url)
+        record = {"post_url": post_url, "actor_name": actor_name.strip()}
+        if actor_profile_url:
+            record["actor_profile_url"] = actor_profile_url
+        records.append(record)
+    return records
+
+
+def _build_post_search_references(
+    references: list[Reference],
+    captured_urls: list[str],
+) -> list[Reference]:
+    """Merge search DOM references with response-derived post permalinks.
+
+    Search pages can virtualize old result cards and frequently omit post URNs
+    from the rendered DOM. Response payloads retain a stable ``postSlugUrl`` or
+    explicit ``feed/update`` URL, so post references are kept first and entity
+    references second. Separate caps prevent author/company links from
+    crowding out the permalinks the search tool is expected to expose.
+    """
+    post_references = [ref for ref in references if ref["kind"] == "feed_post"]
+    entity_references = [ref for ref in references if ref["kind"] != "feed_post"]
+    existing = {ref["url"] for ref in post_references}
+
+    for captured_url in captured_urls:
+        parsed = urlparse(captured_url)
+        relative = parsed.path
+        if parsed.query:
+            relative = f"{relative}?{parsed.query}"
+        if not (
+            relative.startswith("/posts/")
+            or relative.startswith("/feed/update/urn:li:activity:")
+        ):
+            continue
+        if relative in existing:
+            continue
+        post_references.append(
+            {
+                "kind": "feed_post",
+                "url": relative,
+                "context": "search result",
+            }
+        )
+        existing.add(relative)
+
+    return dedupe_references(post_references, cap=500) + dedupe_references(
+        entity_references, cap=500
+    )
+
+
+_POST_SEARCH_CARD_SPLIT_RE = re.compile(r"(?:^|\n)Feed post\s*\n+", re.IGNORECASE)
+_POST_RELATIVE_AGE_RE = re.compile(
+    r"^(?:Reposted\s+)?(?P<count>\d+)\s*(?P<unit>[mhdw])\b",
+    re.IGNORECASE,
+)
+_POST_SEARCH_BOUNDARY_HOURS = {
+    "past_24_hours": 23.0,
+    "past_week": 6 * 24.0,
+    "past_month": 28 * 24.0,
+}
+
+
+def _relative_post_age_hours(value: str) -> float | None:
+    """Convert LinkedIn's compact relative post age into approximate hours."""
+    match = _POST_RELATIVE_AGE_RE.match(value.strip())
+    if not match:
+        return None
+    count = int(match.group("count"))
+    unit = match.group("unit").lower()
+    multiplier = {"m": 1 / 60, "h": 1, "d": 24, "w": 7 * 24}[unit]
+    return round(count * multiplier, 4)
+
+
+def _oldest_post_search_age_hours(text: str) -> float | None:
+    """Return the oldest relative age visible in post-search card text."""
+    ages: list[float] = []
+    parts = _POST_SEARCH_CARD_SPLIT_RE.split(text)
+    for raw_card in parts[1:]:
+        for line in raw_card.splitlines():
+            age = _relative_post_age_hours(line.strip())
+            if age is not None:
+                ages.append(age)
+                break
+    return max(ages) if ages else None
+
+
+def _absolute_linkedin_url(path: str) -> str:
+    if path.startswith("http://") or path.startswith("https://"):
+        return path
+    return f"https://www.linkedin.com{path}"
+
+
+def _profile_slug(profile_url: str | None) -> str | None:
+    if not profile_url:
+        return None
+    path_parts = [part for part in urlparse(profile_url).path.split("/") if part]
+    if len(path_parts) < 2 or path_parts[-2] not in {"in", "company"}:
+        return None
+    return path_parts[-1].lower()
+
+
+def _normalized_card_evidence(value: str) -> str:
+    """Normalize rendered card text for exact, layout-insensitive matching."""
+    return " ".join(value.casefold().split())
+
+
+def _attach_dom_card_permalinks(
+    cards: list[dict[str, Any]],
+    dom_cards: list[dict[str, Any]],
+) -> None:
+    """Attach URLs only when one rendered DOM card uniquely matches one post.
+
+    The match uses exact normalized author, relative-time, and body evidence
+    from the same DOM subtree that exposed the permalink. It intentionally
+    rejects ambiguous duplicate/repost text instead of choosing by proximity.
+    """
+    used_urls: set[str] = set()
+    for dom_card in dom_cards:
+        post_url = dom_card.get("post_url")
+        dom_text = dom_card.get("text")
+        if not isinstance(post_url, str) or not isinstance(dom_text, str):
+            continue
+        dom_evidence = _normalized_card_evidence(dom_text)
+        candidates: list[dict[str, Any]] = []
+        for card in cards:
+            if card.get("post_url"):
+                continue
+            author = _normalized_card_evidence(str(card.get("author") or ""))
+            relative_time = _normalized_card_evidence(
+                str(card.get("relative_time") or "")
+            )
+            body = _normalized_card_evidence(str(card.get("text") or ""))
+            if not author or author not in dom_evidence:
+                continue
+            if relative_time and relative_time not in dom_evidence:
+                continue
+            body_sample = body[: min(len(body), 160)]
+            if len(body_sample) < 20 or body_sample not in dom_evidence:
+                continue
+            candidates.append(card)
+
+        if len(candidates) != 1 or post_url in used_urls:
+            continue
+        card = candidates[0]
+        card["post_url"] = post_url
+        source = str(dom_card.get("url_source") or "dom_permalink")
+        card["url_match"] = source
+        dom_profile_url = dom_card.get("author_profile_url")
+        if not card.get("author_profile_url") and isinstance(dom_profile_url, str):
+            card["author_profile_url"] = dom_profile_url
+        used_urls.add(post_url)
+
+
+def _actor_name_matches(author: str, actor_name: str) -> bool:
+    author_normalized = _normalized_card_evidence(author)
+    actor_normalized = _normalized_card_evidence(actor_name)
+    if not author_normalized or not actor_normalized:
+        return False
+    return (
+        author_normalized == actor_normalized
+        or author_normalized.startswith(f"{actor_normalized} ")
+        or actor_normalized.startswith(f"{author_normalized} ")
+    )
+
+
+def _attach_payload_actor_permalinks(
+    cards: list[dict[str, Any]],
+    payload_posts: list[dict[str, Any]],
+) -> None:
+    """Pair unique rendered authors with actor names beside payload URLs."""
+    candidate_cards_by_payload: dict[int, list[int]] = {}
+    candidate_payloads_by_card: dict[int, list[int]] = {}
+    for payload_index, payload_post in enumerate(payload_posts):
+        actor_name = payload_post.get("actor_name")
+        post_url = payload_post.get("post_url")
+        if not isinstance(actor_name, str) or not isinstance(post_url, str):
+            continue
+        for card_index, card in enumerate(cards):
+            if card.get("post_url"):
+                continue
+            if _actor_name_matches(str(card.get("author") or ""), actor_name):
+                candidate_cards_by_payload.setdefault(payload_index, []).append(
+                    card_index
+                )
+                candidate_payloads_by_card.setdefault(card_index, []).append(
+                    payload_index
+                )
+
+    used_urls = {
+        str(card["post_url"]) for card in cards if isinstance(card.get("post_url"), str)
+    }
+    for payload_index, candidate_cards in candidate_cards_by_payload.items():
+        if len(candidate_cards) != 1:
+            continue
+        card_index = candidate_cards[0]
+        if len(candidate_payloads_by_card.get(card_index, [])) != 1:
+            continue
+        post_url = str(payload_posts[payload_index]["post_url"])
+        if post_url in used_urls:
+            continue
+        cards[card_index]["post_url"] = post_url
+        cards[card_index]["url_match"] = "payload_actor_name"
+        used_urls.add(post_url)
+
+
+def _attach_payload_actor_profiles(
+    cards: list[dict[str, Any]],
+    payload_posts: list[dict[str, Any]],
+) -> None:
+    """Attach payload actor profiles only after a post URL pairing is proven."""
+    profiles_by_post_url = {
+        str(post["post_url"]): str(post["actor_profile_url"])
+        for post in payload_posts
+        if isinstance(post.get("post_url"), str)
+        and isinstance(post.get("actor_profile_url"), str)
+    }
+    for card in cards:
+        if card.get("author_profile_url"):
+            continue
+        post_url = card.get("post_url")
+        if isinstance(post_url, str) and post_url in profiles_by_post_url:
+            card["author_profile_url"] = profiles_by_post_url[post_url]
+
+
+def _attach_bounded_ordered_payload_segments(
+    cards: list[dict[str, Any]],
+    payload_posts: list[dict[str, Any]],
+) -> None:
+    """Pair equal ordered gaps bounded by already-proven card/URL anchors."""
+    payload_index_by_url = {
+        str(post["post_url"]): index
+        for index, post in enumerate(payload_posts)
+        if isinstance(post.get("post_url"), str)
+    }
+    anchors = [
+        (card_index, payload_index_by_url[str(card["post_url"])])
+        for card_index, card in enumerate(cards)
+        if isinstance(card.get("post_url"), str)
+        and str(card["post_url"]) in payload_index_by_url
+    ]
+    anchors.sort()
+    if any(
+        right[1] <= left[1] for left, right in zip(anchors, anchors[1:], strict=False)
+    ):
+        return
+
+    bounded = [(-1, -1), *anchors, (len(cards), len(payload_posts))]
+    used_urls = {
+        str(card["post_url"]) for card in cards if isinstance(card.get("post_url"), str)
+    }
+    for left, right in zip(bounded, bounded[1:], strict=False):
+        card_indexes = list(range(left[0] + 1, right[0]))
+        payload_indexes = list(range(left[1] + 1, right[1]))
+        if not card_indexes or len(card_indexes) != len(payload_indexes):
+            continue
+        if any(cards[index].get("post_url") for index in card_indexes):
+            continue
+        segment_urls = [
+            str(payload_posts[index].get("post_url") or "") for index in payload_indexes
+        ]
+        if any(not url or url in used_urls for url in segment_urls):
+            continue
+        for card_index, post_url in zip(card_indexes, segment_urls, strict=True):
+            cards[card_index]["post_url"] = post_url
+            cards[card_index]["url_match"] = "bounded_ordered_payload"
+            used_urls.add(post_url)
+
+
+def _build_structured_post_results(
+    text: str,
+    references: list[Reference],
+    post_urls: list[str],
+    dom_cards: list[dict[str, Any]] | None = None,
+    payload_posts: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """Parse readable result cards and attach only defensible URL matches.
+
+    Same-card DOM permalink/URN evidence is preferred. Search payload actor
+    names provide a second unique anchor, and equal ordered gaps bounded by
+    proven anchors can be paired without shifting across a missing result.
+    Equal-cardinality streams and unique exposed profile slugs are conservative
+    fallbacks. All ambiguous URLs remain unset.
+    """
+    entity_urls: dict[str, str] = {}
+    for reference in references:
+        if reference["kind"] not in {"person", "company"}:
+            continue
+        display = str(reference.get("text") or "").strip().casefold()
+        if display and display not in entity_urls:
+            entity_urls[display] = _absolute_linkedin_url(reference["url"])
+
+    cards: list[dict[str, Any]] = []
+    for raw_card in _POST_SEARCH_CARD_SPLIT_RE.split(text):
+        lines = [line.strip() for line in raw_card.splitlines() if line.strip()]
+        if not lines:
+            continue
+        age_index = next(
+            (
+                index
+                for index, line in enumerate(lines)
+                if _POST_RELATIVE_AGE_RE.match(line)
+            ),
+            -1,
+        )
+        if age_index < 1:
+            continue
+
+        author = lines[0]
+        headline_lines = [
+            line
+            for line in lines[1:age_index]
+            if line not in {"Follow", "Connect"}
+            and not re.fullmatch(r"•?\s*(?:1st|2nd|3rd\+?)", line)
+        ]
+        body_lines = [
+            line for line in lines[age_index + 1 :] if line not in {"Follow", "Connect"}
+        ]
+        body = "\n".join(body_lines)
+        body = re.split(r"\nAre these results helpful\?", body, maxsplit=1)[0].strip()
+        relative_time = lines[age_index].split("•", 1)[0].strip()
+        profile_url = entity_urls.get(author.casefold())
+        cards.append(
+            {
+                "author": author,
+                "author_profile_url": profile_url,
+                "headline": " | ".join(headline_lines),
+                "relative_time": relative_time,
+                "age_hours": _relative_post_age_hours(relative_time),
+                "text": body,
+                "post_url": None,
+                "url_match": "not_exposed_or_unpaired",
+            }
+        )
+
+    _attach_dom_card_permalinks(cards, dom_cards or [])
+    _attach_payload_actor_permalinks(cards, payload_posts or [])
+    _attach_bounded_ordered_payload_segments(cards, payload_posts or [])
+
+    if len(cards) == len(post_urls):
+        ordered_pairs_are_consistent = all(
+            not card.get("post_url") or card["post_url"] == post_url
+            for card, post_url in zip(cards, post_urls, strict=True)
+        )
+        if ordered_pairs_are_consistent:
+            for card, post_url in zip(cards, post_urls, strict=True):
+                if not card.get("post_url"):
+                    card["post_url"] = post_url
+                    card["url_match"] = "ordered_one_to_one"
+            _attach_payload_actor_profiles(cards, payload_posts or [])
+            return cards
+
+    cards_by_slug: dict[str, list[dict[str, Any]]] = {}
+    for card in cards:
+        if card.get("post_url"):
+            continue
+        slug = _profile_slug(card["author_profile_url"])
+        if slug:
+            cards_by_slug.setdefault(slug, []).append(card)
+
+    used_urls = {
+        str(card["post_url"]) for card in cards if isinstance(card.get("post_url"), str)
+    }
+    urls_by_slug: dict[str, list[str]] = {}
+    for post_url in post_urls:
+        if post_url in used_urls:
+            continue
+        decoded_path = urlparse(post_url).path.lower()
+        for slug in cards_by_slug:
+            if decoded_path.startswith(f"/posts/{slug}_"):
+                urls_by_slug.setdefault(slug, []).append(post_url)
+
+    for slug, slug_cards in cards_by_slug.items():
+        slug_urls = urls_by_slug.get(slug, [])
+        if len(slug_cards) == 1 and len(slug_urls) == 1:
+            slug_cards[0]["post_url"] = slug_urls[0]
+            slug_cards[0]["url_match"] = "unique_author_slug"
+
+    _attach_payload_actor_profiles(cards, payload_posts or [])
+    return cards
+
+
+def _build_post_search_coverage(
+    posts: list[dict[str, Any]],
+    post_urls: list[str],
+    extraction_metadata: dict[str, Any] | None,
+    *,
+    date_posted: str | None,
+    sort_by: str | None,
+    max_pages: int,
+) -> dict[str, Any]:
+    """Summarize observable coverage without claiming LinkedIn exhaustiveness."""
+    scroll = (extraction_metadata or {}).get("scroll") or {}
+    ages = [
+        float(post["age_hours"])
+        for post in posts
+        if isinstance(post.get("age_hours"), int | float)
+    ]
+    observed_oldest_age = (extraction_metadata or {}).get("observed_oldest_age_hours")
+    if not isinstance(observed_oldest_age, int | float):
+        observed_oldest_age = None
+    oldest_age = max(ages) if ages else None
+    if observed_oldest_age is not None:
+        oldest_age = (
+            max(oldest_age, float(observed_oldest_age))
+            if oldest_age is not None
+            else float(observed_oldest_age)
+        )
+    oldest_relative = None
+    if oldest_age is not None:
+        oldest_relative = next(
+            (
+                str(post["relative_time"])
+                for post in reversed(posts)
+                if post.get("age_hours") == oldest_age
+            ),
+            None,
+        )
+
+    normalized_sort = _CONTENT_SORT_BY_MAP.get(sort_by or "", sort_by or "date_posted")
+    boundary_hours = _POST_SEARCH_BOUNDARY_HOURS.get(date_posted or "")
+    stop_reason = str(scroll.get("stop_reason") or "unknown")
+    boundary_reached: bool | None = None
+    if boundary_hours is not None and normalized_sort == "date_posted":
+        boundary_reached = stop_reason == "time_window_boundary" or (
+            oldest_age is not None and oldest_age >= boundary_hours
+        )
+    stable_bottom_reached = bool(
+        scroll.get("stable_bottom_reached", False) or scroll.get("end_reached", False)
+    )
+    explicit_end_marker_seen = bool(scroll.get("explicit_end_marker_seen", False))
+    attempts = int(scroll.get("attempts") or 0)
+    bottom_retries = int(scroll.get("bottom_retries") or 0)
+    dom_card_evidence_count = int(
+        (extraction_metadata or {}).get("dom_card_permalink_count") or 0
+    )
+    payload_actor_evidence_count = int(
+        (extraction_metadata or {}).get("payload_actor_permalink_count") or 0
+    )
+    matched_urls = sum(bool(post.get("post_url")) for post in posts)
+    assigned_urls = {
+        str(post["post_url"]) for post in posts if isinstance(post.get("post_url"), str)
+    }
+    dom_paired = sum(
+        str(post.get("url_match") or "").startswith("dom_") for post in posts
+    )
+    payload_paired = sum(
+        str(post.get("url_match") or "")
+        in {"payload_actor_name", "bounded_ordered_payload"}
+        for post in posts
+    )
+
+    if boundary_reached:
+        status = "time_window_boundary_reached"
+        completion_evidence = "time_window_boundary"
+    elif explicit_end_marker_seen:
+        status = "visible_results_exhausted"
+        completion_evidence = "explicit_end_marker"
+    elif stable_bottom_reached:
+        status = "stable_bottom_before_boundary"
+        completion_evidence = "stable_bottom_only"
+    elif stop_reason == "max_scrolls" or attempts >= max_pages:
+        status = "scroll_budget_exhausted"
+        completion_evidence = "scroll_budget"
+    elif stop_reason == "stalled":
+        status = "stalled_before_boundary"
+        completion_evidence = "scroll_stalled"
+    else:
+        status = "unknown"
+        completion_evidence = "none"
+
+    warnings = [
+        "LinkedIn search visibility and indexing are not exhaustive guarantees."
+    ]
+    if boundary_reached is False:
+        warnings.append(
+            "The oldest loaded result did not reach the requested date boundary."
+        )
+    if stable_bottom_reached and not explicit_end_marker_seen:
+        warnings.append(
+            "The browser reached a stable bottom after delayed retries, but "
+            "LinkedIn did not expose an explicit end-of-results marker."
+        )
+    if matched_urls < len(posts):
+        warnings.append(
+            "Some result cards could not be paired with canonical post URLs without guessing."
+        )
+
+    return {
+        "status": status,
+        "exhaustiveness_guaranteed": False,
+        "visible_results_exhausted": explicit_end_marker_seen,
+        "completion_evidence": completion_evidence,
+        "stable_bottom_reached": stable_bottom_reached,
+        "explicit_end_marker_seen": explicit_end_marker_seen,
+        "requested_max_scrolls": max_pages,
+        "scrolls_attempted": attempts,
+        "bottom_retry_count": bottom_retries,
+        "scroll_stop_reason": stop_reason,
+        "result_card_count": len(posts),
+        "canonical_url_count": len(post_urls),
+        "dom_card_permalink_evidence_count": dom_card_evidence_count,
+        "payload_actor_permalink_evidence_count": payload_actor_evidence_count,
+        "paired_post_count": matched_urls,
+        "dom_paired_post_count": dom_paired,
+        "payload_paired_post_count": payload_paired,
+        "unpaired_post_count": len(posts) - matched_urls,
+        "unassigned_canonical_url_count": len(
+            {url for url in post_urls if url not in assigned_urls}
+        ),
+        "oldest_relative_time": oldest_relative,
+        "oldest_age_hours": oldest_age,
+        "requested_boundary_hours": boundary_hours,
+        "time_window_boundary_reached": boundary_reached,
+        "warnings": warnings,
+    }
 
 
 def _build_feed_references(
@@ -1084,6 +1759,7 @@ class LinkedInExtractor:
         url: str,
         section_name: str,
         max_scrolls: int | None = None,
+        observation_callback: Callable[[], Awaitable[str | None]] | None = None,
     ) -> ExtractedSection:
         """Navigate to a URL, scroll to load lazy content, and extract innerText.
 
@@ -1096,14 +1772,24 @@ class LinkedInExtractor:
         Returns empty string for unexpected non-domain failures (error isolation).
         """
         try:
-            result = await self._extract_page_once(url, section_name, max_scrolls)
+            result = await self._extract_page_once(
+                url,
+                section_name,
+                max_scrolls,
+                observation_callback,
+            )
             if result.text != _RATE_LIMITED_MSG:
                 return result
 
             # Retry once after backoff
             logger.info("Retrying %s after %.0fs backoff", url, _RATE_LIMIT_RETRY_DELAY)
             await asyncio.sleep(_RATE_LIMIT_RETRY_DELAY)
-            return await self._extract_page_once(url, section_name, max_scrolls)
+            return await self._extract_page_once(
+                url,
+                section_name,
+                max_scrolls,
+                observation_callback,
+            )
 
         except LinkedInScraperException:
             raise
@@ -1125,16 +1811,23 @@ class LinkedInExtractor:
         url: str,
         section_name: str,
         max_scrolls: int | None = None,
+        observation_callback: Callable[[], Awaitable[str | None]] | None = None,
     ) -> ExtractedSection:
         """Single attempt to navigate, scroll, and extract innerText."""
         await self._navigate_to_page(url)
-        return await self._extract_loaded_section(url, section_name, max_scrolls)
+        return await self._extract_loaded_section(
+            url,
+            section_name,
+            max_scrolls,
+            observation_callback,
+        )
 
     async def _extract_loaded_section(
         self,
         url: str,
         section_name: str,
         max_scrolls: int | None = None,
+        observation_callback: Callable[[], Awaitable[str | None]] | None = None,
     ) -> ExtractedSection:
         """Run the post-navigation extraction pipeline on the current page.
 
@@ -1252,13 +1945,31 @@ class LinkedInExtractor:
                     logger.debug("Show more click failed: %s", e)
                     break
 
-        # Scroll to trigger lazy loading
+        # Scroll to trigger lazy loading. Content search gets a longer stale
+        # allowance because LinkedIn's lazy result batches often arrive after
+        # several visually unchanged scroll attempts.
+        scroll_metadata: dict[str, Any] | None = None
         if is_activity:
             scrolls = max_scrolls if max_scrolls is not None else 10
-            await scroll_to_bottom(self._page, pause_time=1.0, max_scrolls=scrolls)
+            scroll_result = await scroll_to_bottom(
+                self._page,
+                pause_time=1.0,
+                max_scrolls=scrolls,
+            )
         else:
             scrolls = max_scrolls if max_scrolls is not None else 5
-            await scroll_to_bottom(self._page, pause_time=0.5, max_scrolls=scrolls)
+            is_post_search = "/search/results/content" in url
+            scroll_result = await scroll_to_bottom(
+                self._page,
+                pause_time=0.75 if is_post_search else 0.5,
+                max_scrolls=scrolls,
+                stale_limit=5 if is_post_search else 2,
+                bottom_retry_limit=2 if is_post_search else 0,
+                bottom_retry_pause=2.0 if is_post_search else None,
+                observation_callback=observation_callback,
+            )
+        if isinstance(scroll_result, dict):
+            scroll_metadata = scroll_result
 
         # Extract text from main content area
         raw_result = await self._extract_root_content(["main"])
@@ -1276,6 +1987,7 @@ class LinkedInExtractor:
         return ExtractedSection(
             text=cleaned,
             references=build_references(raw_result["references"], section_name),
+            metadata={"scroll": scroll_metadata} if scroll_metadata else None,
         )
 
     async def _extract_overlay(
@@ -2511,19 +3223,672 @@ class LinkedInExtractor:
             result["section_errors"] = section_errors
         return result
 
-    async def _extract_job_ids(self) -> list[str]:
-        """Extract unique job IDs from job card links on the current page.
+    async def save_job(self, job_id: str) -> dict[str, Any]:
+        """Save a single job posting to the authenticated LinkedIn account."""
+        url = f"https://www.linkedin.com/jobs/view/{job_id}/"
+        await self._navigate_to_page(url)
+        await detect_rate_limit(self._page)
+        await handle_modal_close(self._page)
 
-        Finds all `a[href*="/jobs/view/"]` links and extracts the numeric
-        job ID from each href. Returns deduplicated IDs in DOM order.
+        state = await self._job_save_button_state()
+        if state == "saved":
+            return {"url": url, "job_id": job_id, "saved": True, "already_saved": True}
+
+        clicked = await self._click_job_save_button("unsaved")
+        if not clicked:
+            raise LinkedInScraperException(
+                "Could not find or click the LinkedIn Save button for this job."
+            )
+
+        await asyncio.sleep(1)
+        return {"url": url, "job_id": job_id, "saved": True, "already_saved": False}
+
+    async def unsave_job(self, job_id: str) -> dict[str, Any]:
+        """Remove a job posting from the authenticated account's saved jobs."""
+        url = f"https://www.linkedin.com/jobs/view/{job_id}/"
+        await self._navigate_to_page(url)
+        await detect_rate_limit(self._page)
+        await handle_modal_close(self._page)
+
+        state = await self._job_save_button_state()
+        if state == "unsaved":
+            return {
+                "url": url,
+                "job_id": job_id,
+                "saved": False,
+                "already_unsaved": True,
+            }
+
+        clicked = await self._click_job_save_button("saved")
+        if not clicked:
+            raise LinkedInScraperException(
+                "Could not find or click the LinkedIn saved-job button for this job."
+            )
+
+        await asyncio.sleep(1)
+        return {
+            "url": url,
+            "job_id": job_id,
+            "saved": False,
+            "already_unsaved": False,
+        }
+
+    async def _extract_saved_job_cards(self) -> list[dict[str, str]]:
+        """Capture saved-job card text keyed by job ID.
+
+        A saved-job list groups each posting under a card element whose only
+        ``/jobs/view/<id>`` link is the posting's title link. Climb from each
+        title anchor to the deepest ancestor that still contains exactly one
+        job link; that ancestor is the card. Uses only URL patterns and
+        structural containment, no LinkedIn class names or localized text.
+        """
+        raw_cards = await self._page.evaluate(
+            """() => {
+                const main = document.querySelector('main') || document.body;
+                const jobIdFromHref = href => {
+                    if (!href) return null;
+                    let parsed;
+                    try {
+                        parsed = new URL(href, window.location.origin);
+                    } catch {
+                        return null;
+                    }
+                    const match = parsed.pathname.match(/^\\/jobs\\/view\\/(\\d+)/);
+                    return match ? match[1] : null;
+                };
+
+                const byId = new Map();
+                for (const anchor of main.querySelectorAll(
+                    'a[href*="/jobs/view/"]'
+                )) {
+                    const jobId = jobIdFromHref(anchor.getAttribute('href'));
+                    if (!jobId || byId.has(jobId)) continue;
+
+                    const jobLinkCount = el =>
+                        el.querySelectorAll('a[href*="/jobs/view/"]').length;
+
+                    let current = anchor;
+                    let best = null;
+                    while (current && current !== main.parentElement) {
+                        if (jobLinkCount(current) > 1) break;
+                        const text = (current.innerText || '').trim();
+                        if (text.length >= 40) best = current;
+                        current = current.parentElement;
+                    }
+
+                    const card = best || anchor;
+                    byId.set(jobId, {
+                        job_id: jobId,
+                        card_text: (card.innerText || '').trim().slice(0, 600),
+                    });
+                }
+                return Array.from(byId.values());
+            }"""
+        )
+        if not isinstance(raw_cards, list):
+            return []
+
+        cards: list[dict[str, str]] = []
+        for raw_card in raw_cards:
+            if not isinstance(raw_card, dict):
+                continue
+            job_id = raw_card.get("job_id")
+            card_text = raw_card.get("card_text")
+            if not isinstance(job_id, str) or not isinstance(card_text, str):
+                continue
+            cards.append({"job_id": job_id, "card_text": card_text})
+        return cards
+
+    async def _click_saved_jobs_next_page(self) -> bool:
+        """Click the saved-jobs pagination Next control when present.
+
+        Pagination renders as ``BUTTON`` elements with visible text
+        ``1``/``2``/``3``/``Next`` (numbered buttons carry
+        ``aria-label="Page N"``; ``Next`` carries no aria label). Uses only
+        tag/text/aria signals inside ``main`` — no LinkedIn class names.
+        The en-US "Next" label is guaranteed by BrowserManager forcing
+        en-US. Returns True when a click was issued.
+        """
+        try:
+            clicked = await self._page.evaluate(
+                """() => {
+                    const main = document.querySelector('main') || document.body;
+                    const candidates = Array.from(
+                        main.querySelectorAll('button, a[href]')
+                    );
+                    const norm = el => (el.innerText || '').trim().toLowerCase();
+                    const aria = el =>
+                        (el.getAttribute('aria-label') || '').trim().toLowerCase();
+                    for (const el of candidates) {
+                        const text = norm(el);
+                        const label = aria(el);
+                        const isNext =
+                            text === 'next' ||
+                            text.endsWith(' next') ||
+                            label === 'next' ||
+                            label.startsWith('next ');
+                        if (!isNext) continue;
+                        if (el.getAttribute('aria-disabled') === 'true') continue;
+                        if (el.hasAttribute('disabled')) continue;
+                        try {
+                            el.scrollIntoView({ block: 'nearest' });
+                        } catch {}
+                        el.click();
+                        return true;
+                    }
+                    return false;
+                }"""
+            )
+        except Exception:
+            return False
+        return clicked is True
+
+    async def _saved_jobs_first_id(self) -> str | None:
+        """Return the first saved-job ID currently rendered, if any."""
+        try:
+            first = await self._page.evaluate(
+                """() => {
+                    const main = document.querySelector('main') || document.body;
+                    for (const anchor of main.querySelectorAll(
+                        'a[href*="/jobs/view/"]'
+                    )) {
+                        const href = anchor.getAttribute('href') || '';
+                        let parsed;
+                        try {
+                            parsed = new URL(href, window.location.origin);
+                        } catch {
+                            continue;
+                        }
+                        const match = parsed.pathname.match(
+                            /^\\/jobs\\/view\\/(\\d+)/
+                        );
+                        if (match) return match[1];
+                    }
+                    return null;
+                }"""
+            )
+        except Exception:
+            return None
+        return first if isinstance(first, str) else None
+
+    async def _wait_for_saved_jobs_page_change(
+        self, previous_first_id: str | None, timeout: float = 10.0
+    ) -> None:
+        """Wait until the rendered saved-jobs list turns over after paging."""
+        steps = max(1, int(timeout))
+        for _ in range(steps):
+            await asyncio.sleep(1.0)
+            if await self._saved_jobs_first_id() != previous_first_id:
+                return
+
+    async def list_saved_jobs(self, max_scrolls: int = 25) -> dict[str, Any]:
+        """List the authenticated account's saved jobs.
+
+        Navigates to the saved-jobs page, then scrolls the list to trigger
+        lazy loading until no new job IDs appear, merging card snapshots by
+        job ID so virtualized cards scrolled out of the DOM are kept.
+
+        Args:
+            max_scrolls: Maximum scroll attempts before stopping.
+
+        Returns:
+            {url, sections: {saved_jobs: text}, job_ids: [str],
+             jobs: [{job_id, job_url, card_text}]}
+        """
+        max_scrolls = max(1, min(100, max_scrolls))
+        url = "https://www.linkedin.com/my-items/saved-jobs/"
+        await self._navigate_to_page(url)
+        await detect_rate_limit(self._page)
+        await handle_modal_close(self._page)
+
+        try:
+            await self._page.wait_for_selector("main")
+        except PlaywrightTimeoutError:
+            logger.debug("No <main> element found on %s", url)
+
+        cards: dict[str, dict[str, str]] = {}
+        stale_scrolls = 0
+        scrolls_used = 0
+        # Paginate: each page gets a scroll-stable pass, then follow Next.
+        # Cap pages so max_scrolls still bounds total work.
+        max_pages = max(1, min(10, max_scrolls))
+        for _page in range(max_pages):
+            for _ in range(max_scrolls - scrolls_used):
+                batch = await self._extract_saved_job_cards()
+                new_ids = [
+                    card["job_id"] for card in batch if card["job_id"] not in cards
+                ]
+                for card in batch:
+                    cards.setdefault(card["job_id"], card)
+                if new_ids:
+                    stale_scrolls = 0
+                else:
+                    stale_scrolls += 1
+                    if stale_scrolls >= 2:
+                        break
+                await self._scroll_main_scrollable_region(
+                    position="bottom", attempts=1, pause_time=0.8
+                )
+                scrolls_used += 1
+                if scrolls_used >= max_scrolls:
+                    break
+            if scrolls_used >= max_scrolls:
+                break
+            first_before_click = await self._saved_jobs_first_id()
+            try:
+                has_next = await self._click_saved_jobs_next_page()
+            except Exception:
+                has_next = False
+            if not has_next:
+                break
+            await self._wait_for_saved_jobs_page_change(first_before_click)
+            try:
+                await self._page.wait_for_selector("main")
+            except PlaywrightTimeoutError:
+                logger.debug("No <main> element found after pagination on %s", url)
+            stale_scrolls = 0
+
+        job_ids = list(cards.keys())
+        jobs = [
+            {
+                "job_id": job_id,
+                "job_url": f"https://www.linkedin.com/jobs/view/{job_id}/",
+                "card_text": cards[job_id]["card_text"],
+            }
+            for job_id in job_ids
+        ]
+
+        page_text = await self.get_page_text()
+        result: dict[str, Any] = {
+            "url": url,
+            "sections": {"saved_jobs": page_text} if page_text else {},
+            "job_ids": job_ids,
+            "jobs": jobs,
+        }
+        return result
+
+    async def _extract_post_search_dom_cards(self) -> list[dict[str, str]]:
+        """Capture card text and its permalink from the same DOM subtree.
+
+        A permalink is not present in ``innerText``, so this narrowly scoped
+        DOM pass is necessary to establish a defensible card-to-URL
+        association. It uses only URL/URN attributes and structural
+        containment; no LinkedIn class names or localized UI text.
+        """
+        raw_cards = await self._page.evaluate(
+            """() => {
+                const main = document.querySelector('main');
+                if (!main) return [];
+
+                const canonicalPostUrl = rawValue => {
+                    if (!rawValue) return null;
+                    if (rawValue.startsWith('urn:li:activity:')) {
+                        return `https://www.linkedin.com/feed/update/${rawValue}/`;
+                    }
+                    let parsed;
+                    try {
+                        parsed = new URL(rawValue, window.location.origin);
+                    } catch {
+                        return null;
+                    }
+                    if (parsed.hostname !== 'linkedin.com'
+                        && !parsed.hostname.endsWith('.linkedin.com')) {
+                        return null;
+                    }
+                    const postMatch = parsed.pathname.match(/^\\/posts\\/[^/?#]+/);
+                    if (postMatch) {
+                        return `https://www.linkedin.com${postMatch[0]}`;
+                    }
+                    const feedMatch = parsed.pathname.match(
+                        /^\\/feed\\/update\\/urn:li:activity:\\d+/
+                    );
+                    if (feedMatch) {
+                        return `https://www.linkedin.com${feedMatch[0]}/`;
+                    }
+                    return null;
+                };
+
+                const elementUrn = element => {
+                    for (const name of ['data-urn', 'data-entity-urn']) {
+                        const value = (element.getAttribute?.(name) || '').trim();
+                        const match = value.match(/urn:li:activity:\\d+/);
+                        if (match) return match[0];
+                    }
+                    return null;
+                };
+
+                const postKeys = root => {
+                    const keys = new Set();
+                    const addElement = element => {
+                        const urn = elementUrn(element);
+                        const urnUrl = canonicalPostUrl(urn);
+                        if (urnUrl) keys.add(urnUrl);
+                        if (element.tagName === 'A') {
+                            const hrefUrl = canonicalPostUrl(
+                                element.getAttribute('href')
+                            );
+                            if (hrefUrl) keys.add(hrefUrl);
+                        }
+                    };
+                    addElement(root);
+                    for (const element of root.querySelectorAll(
+                        'a[href*="/posts/"], '
+                        + 'a[href*="/feed/update/urn:li:activity:"], '
+                        + '[data-urn*="urn:li:activity:"], '
+                        + '[data-entity-urn*="urn:li:activity:"]'
+                    )) {
+                        addElement(element);
+                    }
+                    return keys;
+                };
+
+                const findCardRoot = (seed, postUrl) => {
+                    let current = seed;
+                    let best = null;
+                    while (current && current !== main.parentElement) {
+                        const keys = postKeys(current);
+                        if (!keys.has(postUrl) || keys.size > 1) break;
+                        const text = (current.innerText || '').trim();
+                        const author = current.querySelector(
+                            'a[href*="/in/"], a[href*="/company/"]'
+                        );
+                        if (text.length >= 80 && author) best = current;
+                        current = current.parentElement;
+                    }
+                    return best;
+                };
+
+                const seeds = [];
+                for (const anchor of main.querySelectorAll(
+                    'a[href*="/posts/"], '
+                    + 'a[href*="/feed/update/urn:li:activity:"]'
+                )) {
+                    const postUrl = canonicalPostUrl(anchor.getAttribute('href'));
+                    if (postUrl) {
+                        seeds.push({element: anchor, postUrl, source: 'dom_permalink'});
+                    }
+                }
+                for (const element of main.querySelectorAll(
+                    '[data-urn*="urn:li:activity:"], '
+                    + '[data-entity-urn*="urn:li:activity:"]'
+                )) {
+                    const postUrl = canonicalPostUrl(elementUrn(element));
+                    if (postUrl) {
+                        seeds.push({element, postUrl, source: 'dom_activity_urn'});
+                    }
+                }
+
+                const byUrl = new Map();
+                for (const seed of seeds) {
+                    const root = findCardRoot(seed.element, seed.postUrl);
+                    if (!root) continue;
+                    const text = (root.innerText || '').trim();
+                    const authorAnchor = root.querySelector(
+                        'a[href*="/in/"], a[href*="/company/"]'
+                    );
+                    const authorProfileUrl = authorAnchor
+                        ? new URL(
+                            authorAnchor.getAttribute('href'),
+                            window.location.origin
+                        ).href
+                        : null;
+                    const candidate = {
+                        text,
+                        post_url: seed.postUrl,
+                        author_profile_url: authorProfileUrl,
+                        url_source: seed.source,
+                    };
+                    const existing = byUrl.get(seed.postUrl);
+                    if (!existing || candidate.text.length > existing.text.length) {
+                        byUrl.set(seed.postUrl, candidate);
+                    }
+                }
+                return Array.from(byUrl.values());
+            }"""
+        )
+        if not isinstance(raw_cards, list):
+            return []
+
+        cards: list[dict[str, str]] = []
+        for raw_card in raw_cards:
+            if not isinstance(raw_card, dict):
+                continue
+            text = raw_card.get("text")
+            post_url = raw_card.get("post_url")
+            if not isinstance(text, str) or not isinstance(post_url, str):
+                continue
+            card = {
+                "text": text,
+                "post_url": post_url,
+                "url_source": str(raw_card.get("url_source") or "dom_permalink"),
+            }
+            author_profile_url = raw_card.get("author_profile_url")
+            if isinstance(author_profile_url, str) and author_profile_url:
+                card["author_profile_url"] = author_profile_url
+            cards.append(card)
+        return cards
+
+    async def extract_post_search(
+        self,
+        url: str,
+        max_scrolls: int,
+        boundary_hours: float | None = None,
+    ) -> ExtractedSection:
+        """Extract a content-search page while capturing post permalinks.
+
+        LinkedIn's current search UI often renders result text without post
+        permalink anchors or ``data-urn`` attributes. Registering the response
+        listener before navigation captures permalinks from both the initial
+        document and lazy Voyager/SDUI batches while ``extract_page`` performs
+        the normal search scrolling.
+        """
+        captured_urls: list[str] = []
+        dom_cards_by_url: dict[str, dict[str, str]] = {}
+        payload_batches: dict[int, tuple[list[str], list[dict[str, str]]]] = {}
+        pending_reads: list[asyncio.Task[None]] = []
+        response_sequence = 0
+        observed_oldest_age_hours: float | None = None
+
+        async def _capture_dom_cards() -> str | None:
+            nonlocal observed_oldest_age_hours
+            try:
+                dom_cards = await self._extract_post_search_dom_cards()
+            except Exception as exc:
+                logger.debug("Could not capture structured post cards: %s", exc)
+            else:
+                for card in dom_cards:
+                    post_url = card["post_url"]
+                    existing = dom_cards_by_url.get(post_url)
+                    if existing is None or len(card["text"]) > len(existing["text"]):
+                        dom_cards_by_url[post_url] = card
+
+            if boundary_hours is None:
+                return None
+            try:
+                visible_text = await self._page.locator("main").inner_text(timeout=2000)
+                visible_oldest = _oldest_post_search_age_hours(visible_text)
+            except Exception as exc:
+                logger.debug("Could not inspect post-search date boundary: %s", exc)
+                return None
+            if visible_oldest is None:
+                return None
+            if (
+                observed_oldest_age_hours is None
+                or visible_oldest > observed_oldest_age_hours
+            ):
+                observed_oldest_age_hours = visible_oldest
+            if visible_oldest >= boundary_hours:
+                return "time_window_boundary"
+            return None
+
+        def _handle_response(resp: Any) -> None:
+            nonlocal response_sequence
+            if not _is_post_search_payload_response(resp.url):
+                return
+            sequence = response_sequence
+            response_sequence += 1
+
+            async def _read() -> None:
+                try:
+                    body = await resp.body()
+                except Exception:
+                    return
+                if not body:
+                    return
+                payload = body.decode("utf-8", errors="replace")
+                payload_batches[sequence] = (
+                    _post_urls_from_payload(payload),
+                    _post_records_from_payload(payload),
+                )
+
+            pending_reads.append(asyncio.create_task(_read()))
+
+        self._page.on("response", _handle_response)
+        try:
+            extracted = await self.extract_page(
+                url,
+                section_name="post_search_results",
+                max_scrolls=max_scrolls,
+                observation_callback=_capture_dom_cards,
+            )
+        finally:
+            try:
+                self._page.remove_listener("response", _handle_response)
+            except Exception:
+                pass
+            await _drain_listener_tasks(pending_reads)
+
+        payload_posts: list[dict[str, str]] = []
+        seen_urls: set[str] = set()
+        for sequence in sorted(payload_batches):
+            batch_urls, batch_posts = payload_batches[sequence]
+            for post_url in batch_urls:
+                if post_url not in seen_urls:
+                    seen_urls.add(post_url)
+                    captured_urls.append(post_url)
+            for payload_post in batch_posts:
+                if not any(
+                    existing["post_url"] == payload_post["post_url"]
+                    for existing in payload_posts
+                ):
+                    payload_posts.append(payload_post)
+        for post_url in dom_cards_by_url:
+            if post_url not in seen_urls:
+                seen_urls.add(post_url)
+                captured_urls.append(post_url)
+
+        metadata = dict(extracted.metadata or {})
+        metadata["post_cards"] = list(dom_cards_by_url.values())
+        metadata["dom_card_permalink_count"] = len(dom_cards_by_url)
+        metadata["payload_posts"] = payload_posts
+        metadata["payload_actor_permalink_count"] = len(payload_posts)
+        metadata["observed_oldest_age_hours"] = observed_oldest_age_hours
+
+        return ExtractedSection(
+            text=extracted.text,
+            references=_build_post_search_references(
+                extracted.references, captured_urls
+            ),
+            error=extracted.error,
+            metadata=metadata,
+        )
+
+    async def _job_save_labels(self) -> dict[str, str]:
+        """Return labels for the active browser locale, or fail closed."""
+        locale = await self._page.evaluate("() => navigator.language || ''")
+        labels = (
+            _JOB_SAVE_LABELS_BY_LOCALE.get(locale) if isinstance(locale, str) else None
+        )
+        if labels is None:
+            raise LinkedInScraperException(
+                "Job save-state detection is not supported for browser locale "
+                f"{locale!r}."
+            )
+        return labels
+
+    async def _job_save_button_state(self) -> Literal["saved", "unsaved"]:
+        """Read the job Save control's state using the per-locale label table."""
+        labels = await self._job_save_labels()
+        state = await self._page.evaluate(
+            """({ labels }) => {
+                const root = document.querySelector('main') || document.body;
+                const normalize = value =>
+                    (value || '').replace(/\\s+/g, ' ').trim();
+                const controls = Array.from(
+                    root.querySelectorAll('button, [role="button"]')
+                ).filter(element => {
+                    if (element.hasAttribute('aria-expanded')) return false;
+                    if (element.hasAttribute('disabled')) return false;
+                    const text = normalize(element.innerText || element.textContent);
+                    return text === labels.saved || text === labels.unsaved;
+                });
+                if (controls.length !== 1) return null;
+                const text = normalize(
+                    controls[0].innerText || controls[0].textContent
+                );
+                return text === labels.saved ? 'saved' : 'unsaved';
+            }""",
+            {"labels": labels},
+        )
+        if state not in {"saved", "unsaved"}:
+            raise LinkedInScraperException(
+                "Could not uniquely identify the LinkedIn job Save control."
+            )
+        return state
+
+    async def _click_job_save_button(
+        self, expected_state: Literal["saved", "unsaved"] = "unsaved"
+    ) -> bool:
+        """Click the unique job Save control when it has *expected_state*."""
+        labels = await self._job_save_labels()
+        try:
+            return bool(
+                await self._page.evaluate(
+                    """({ expectedLabel }) => {
+                        const root = document.querySelector('main') || document.body;
+                        const normalize = value =>
+                            (value || '').replace(/\\s+/g, ' ').trim();
+                        const controls = Array.from(
+                            root.querySelectorAll('button, [role="button"]')
+                        ).filter(element =>
+                            !element.hasAttribute('aria-expanded') &&
+                            !element.hasAttribute('disabled') &&
+                            normalize(element.innerText || element.textContent) ===
+                                expectedLabel
+                        );
+                        if (controls.length !== 1) return false;
+                        controls[0].click();
+                        return true;
+                    }""",
+                    {"expectedLabel": labels[expected_state]},
+                )
+            )
+        except Exception:
+            logger.debug("Job Save button click failed", exc_info=True)
+            return False
+
+    async def _extract_job_ids(self) -> list[str]:
+        """Extract unique job IDs from old and AI-search result cards.
+
+        Classic search cards expose ``/jobs/view/`` links. AI-search cards use
+        a ``componentkey`` containing ``job-card-component-ref-<id>`` and may
+        expose a job link only for the selected card. Returns deduplicated IDs
+        in DOM order.
         """
         return await self._page.evaluate(
             """() => {
-                const links = document.querySelectorAll('a[href*="/jobs/view/"]');
+                const nodes = document.querySelectorAll(
+                  '[componentkey*="job-card-component-ref-"], '
+                  + 'a[href*="/jobs/view/"]'
+                );
                 const seen = new Set();
                 const ids = [];
-                for (const a of links) {
-                    const match = a.href.match(/\\/jobs\\/view\\/(\\d+)/);
+                for (const node of nodes) {
+                    const componentKey = node.getAttribute('componentkey') || '';
+                    const href = node.href || '';
+                    const match = componentKey.match(
+                      /job-card-component-ref-(\\d+)/
+                    ) || href.match(/\\/jobs\\/view\\/(\\d+)/);
                     if (match && !seen.has(match[1])) {
                         seen.add(match[1]);
                         ids.push(match[1]);
@@ -2531,6 +3896,22 @@ class LinkedInExtractor:
                 }
                 return ids;
             }"""
+        )
+
+    async def _has_visible_job_cards(self) -> bool:
+        """Return whether the current page visibly contains job result cards."""
+        return bool(
+            await self._page.evaluate(
+                """() => {
+                    const nodes = document.querySelectorAll(
+                      '[componentkey*="job-card-component-ref-"], '
+                      + 'a[href*="/jobs/view/"]'
+                    );
+                    return Array.from(nodes).some(
+                      node => node.getClientRects().length > 0
+                    );
+                }"""
+            )
         )
 
     async def _extract_search_page(
@@ -2682,6 +4063,74 @@ class LinkedInExtractor:
 
         return f"https://www.linkedin.com/jobs/search/?{params}"
 
+    @staticmethod
+    def _is_job_search_url(url: str) -> bool:
+        """Return whether *url* is either LinkedIn job-search route."""
+        path = urlparse(url).path.rstrip("/")
+        return path in {"/jobs/search", "/jobs/search-results"}
+
+    @staticmethod
+    def _is_ai_job_search_url(url: str) -> bool:
+        """Return whether *url* is LinkedIn's AI job-search route."""
+        return urlparse(url).path.rstrip("/") == "/jobs/search-results"
+
+    @staticmethod
+    def _build_ai_job_search_keywords(
+        keywords: str,
+        *,
+        location: str | None = None,
+        job_type: str | None = None,
+        experience_level: str | None = None,
+        work_type: str | None = None,
+        easy_apply: bool = False,
+        sort_by: str | None = None,
+    ) -> str:
+        """Express classic job-search facets in AI-search query language."""
+
+        def describe_csv(value: str, mapping: dict[str, str]) -> str:
+            values = [part.strip() for part in value.split(",") if part.strip()]
+            return " or ".join(
+                mapping.get(part, part.replace("_", " ")) for part in values
+            )
+
+        refinements: list[str] = []
+        if location:
+            if location.strip().casefold() == "remote":
+                refinements.append("remote")
+            else:
+                refinements.append(f"in {location.strip()}")
+        if job_type:
+            refinements.append(describe_csv(job_type, _AI_JOB_TYPE_MAP))
+        if experience_level:
+            refinements.append(describe_csv(experience_level, _AI_EXPERIENCE_LEVEL_MAP))
+        if work_type:
+            refinements.append(describe_csv(work_type, _AI_WORK_TYPE_MAP))
+        if easy_apply:
+            refinements.append("Easy Apply jobs")
+        if sort_by:
+            refinements.append(
+                _AI_SORT_BY_MAP.get(sort_by.strip(), sort_by.replace("_", " "))
+            )
+
+        return ", ".join([keywords, *refinements])
+
+    @staticmethod
+    def _verify_ai_job_search_redirect(expected_url: str, actual_url: str) -> None:
+        """Fail if critical AI-search parameters were discarded by a redirect."""
+        expected = parse_qs(urlparse(expected_url).query)
+        actual = parse_qs(urlparse(actual_url).query)
+        missing = [
+            name
+            for name in ("keywords", "f_TPR", "start")
+            if name in expected and actual.get(name) != expected[name]
+        ]
+        if missing:
+            labels = ", ".join(missing)
+            raise LinkedInScraperException(
+                "LinkedIn AI job search discarded requested search parameters "
+                f"after redirect: {labels}."
+            )
+
     async def search_jobs(
         self,
         keywords: str,
@@ -2714,7 +4163,7 @@ class LinkedInExtractor:
         Returns:
             {url, sections: {search_results: text}, job_ids: [str]}
         """
-        base_url = self._build_job_search_url(
+        requested_url = self._build_job_search_url(
             keywords,
             location=location,
             date_posted=date_posted,
@@ -2724,6 +4173,8 @@ class LinkedInExtractor:
             easy_apply=easy_apply,
             sort_by=sort_by,
         )
+        base_url = requested_url
+        ai_search = False
         all_job_ids: list[str] = []
         seen_ids: set[str] = set()
         page_texts: list[str] = []
@@ -2752,11 +4203,54 @@ class LinkedInExtractor:
                     url, section_name="search_results"
                 )
 
+                # Some accounts are redirected to LinkedIn's AI search, which
+                # drops classic location/experience/sort facets. Reissue the
+                # page once with those facets expressed in the AI query.
+                if self._is_ai_job_search_url(self._page.url) and not ai_search:
+                    ai_search = True
+                    ai_keywords = self._build_ai_job_search_keywords(
+                        keywords,
+                        location=location,
+                        job_type=job_type,
+                        experience_level=experience_level,
+                        work_type=work_type,
+                        easy_apply=easy_apply,
+                        sort_by=sort_by,
+                    )
+                    base_url = self._build_job_search_url(
+                        ai_keywords,
+                        location=location,
+                        date_posted=date_posted,
+                        job_type=job_type,
+                        experience_level=experience_level,
+                        work_type=work_type,
+                        easy_apply=easy_apply,
+                        sort_by=sort_by,
+                    )
+                    fallback_url = (
+                        base_url
+                        if page_num == 0
+                        else f"{base_url}&start={page_num * _PAGE_SIZE}"
+                    )
+                    if fallback_url != url:
+                        url = fallback_url
+                        extracted = await self._extract_search_page(
+                            url, section_name="search_results"
+                        )
+
                 if not extracted.text or extracted.text == _RATE_LIMITED_MSG:
                     if extracted.error:
                         section_errors["search_results"] = extracted.error
                     # Navigation failed or rate-limited; skip ID extraction
                     break
+
+                if not self._is_job_search_url(self._page.url):
+                    raise LinkedInScraperException(
+                        "LinkedIn job search redirected to an unexpected page: "
+                        f"{self._page.url}"
+                    )
+                if ai_search:
+                    self._verify_ai_job_search_redirect(url, self._page.url)
 
                 # Read total pages from pagination state (once only, best-effort)
                 if not total_pages_queried:
@@ -2769,20 +4263,12 @@ class LinkedInExtractor:
                         if total_pages is not None:
                             logger.debug("LinkedIn reports %d total pages", total_pages)
 
-                # Extract job IDs from hrefs (page is already loaded)
-                if not self._page.url.startswith(
-                    "https://www.linkedin.com/jobs/search/"
-                ):
-                    logger.debug(
-                        "Unexpected page URL after extraction: %s — "
-                        "skipping job ID extraction",
-                        self._page.url,
-                    )
-                    page_texts.append(extracted.text)
-                    if extracted.references:
-                        page_references.extend(extracted.references)
-                    break
                 page_ids = await self._extract_job_ids()
+                if not page_ids and await self._has_visible_job_cards():
+                    raise LinkedInScraperException(
+                        "LinkedIn job search displayed result cards but no job IDs "
+                        "could be extracted. The result-card format may have changed."
+                    )
                 new_ids = [jid for jid in page_ids if jid not in seen_ids]
 
                 if not new_ids:
@@ -2819,6 +4305,9 @@ class LinkedInExtractor:
             else {},
             "job_ids": all_job_ids,
         }
+        if ai_search:
+            result["requested_url"] = requested_url
+            result["search_mode"] = "ai"
         if page_references:
             result["references"] = {
                 "search_results": dedupe_references(page_references, cap=15)
@@ -2897,6 +4386,144 @@ class LinkedInExtractor:
         }
         if references:
             result["references"] = references
+        if section_errors:
+            result["section_errors"] = section_errors
+        return result
+
+    @staticmethod
+    def _build_post_search_url(
+        keywords: str,
+        date_posted: str | None = None,
+        sort_by: str | None = None,
+    ) -> str:
+        """Build a LinkedIn content search URL with optional filters.
+
+        Human-readable names are normalized to LinkedIn URL values. Unknown
+        values pass through unchanged so callers can try newly introduced
+        LinkedIn filters before the server knows about them.
+        """
+        params = f"keywords={quote_plus(keywords)}"
+        if date_posted:
+            mapped = _CONTENT_DATE_POSTED_MAP.get(date_posted.strip(), date_posted)
+            params += "&origin=FACETED_SEARCH"
+            params += f"&datePosted={quote_plus(json.dumps([mapped]))}"
+        if sort_by:
+            mapped = _CONTENT_SORT_BY_MAP.get(sort_by.strip(), sort_by)
+            params += f"&sortBy={quote_plus(json.dumps(mapped))}"
+
+        return f"https://www.linkedin.com/search/results/content/?{params}"
+
+    async def search_posts(
+        self,
+        keywords: str,
+        date_posted: str | None = None,
+        sort_by: str | None = None,
+        max_pages: int = 3,
+        *,
+        include_raw: bool = True,
+    ) -> dict[str, Any]:
+        """Search LinkedIn posts/content and extract result pages.
+
+        Args:
+            keywords: Search keywords or LinkedIn-supported Boolean query.
+            date_posted: Optional recency filter. Known aliases:
+                ``past_24_hours``, ``past_week``, ``past_month``.
+            sort_by: Optional result ordering. Known aliases:
+                ``date``/``date_posted`` or ``relevance``.
+            max_pages: Maximum scroll batches to load (1-100 at the tool
+                boundary, default 3). Broad post searches may need deep
+                scrolling or narrower query shards to reach the requested
+                time-window boundary.
+            include_raw: Include the legacy raw ``sections`` and ``references``
+                payloads. Structured posts, canonical URLs, and coverage are
+                always returned.
+
+        Returns:
+            Structured ``posts``, canonical ``post_urls``, and observable
+            ``coverage`` metadata. Legacy raw sections/references are included
+            only when ``include_raw`` is true.
+        """
+        effective_sort = sort_by or "date_posted"
+        base_url = self._build_post_search_url(
+            keywords,
+            date_posted=date_posted,
+            sort_by=effective_sort,
+        )
+        page_texts: list[str] = []
+        page_references: list[Reference] = []
+        section_errors: dict[str, dict[str, Any]] = {}
+        extraction_metadata: dict[str, Any] | None = None
+        normalized_sort = _CONTENT_SORT_BY_MAP.get(effective_sort, effective_sort)
+        boundary_hours = (
+            _POST_SEARCH_BOUNDARY_HOURS.get(date_posted or "")
+            if normalized_sort == "date_posted"
+            else None
+        )
+
+        try:
+            extracted = await self.extract_post_search(
+                base_url,
+                max_scrolls=max_pages,
+                boundary_hours=boundary_hours,
+            )
+            extraction_metadata = extracted.metadata
+
+            if not extracted.text or extracted.text == _RATE_LIMITED_MSG:
+                if extracted.text == _RATE_LIMITED_MSG:
+                    section_errors["search_results"] = {
+                        "error_type": "rate_limit",
+                        "error_message": extracted.text,
+                    }
+                elif extracted.error:
+                    section_errors["search_results"] = extracted.error
+            else:
+                page_texts.append(extracted.text)
+                if extracted.references:
+                    page_references.extend(extracted.references)
+
+        except LinkedInScraperException:
+            raise
+        except Exception as e:
+            logger.warning("Error on post search page: %s", e)
+            section_errors["search_results"] = build_issue_diagnostics(
+                e,
+                context="search_posts",
+                target_url=base_url,
+                section_name="search_results",
+            )
+
+        search_text = "\n---\n".join(page_texts)
+        result: dict[str, Any] = {"url": base_url}
+        result_references: list[Reference] = []
+        post_urls: list[str] = []
+        if page_references:
+            result_references = _build_post_search_references(page_references, [])
+            post_urls = [
+                f"https://www.linkedin.com{reference['url']}"
+                for reference in result_references
+                if reference["kind"] == "feed_post"
+            ]
+        result["post_urls"] = post_urls
+        if include_raw:
+            result["sections"] = {"search_results": search_text} if search_text else {}
+            if result_references:
+                result["references"] = {"search_results": result_references}
+        posts = _build_structured_post_results(
+            search_text,
+            result_references,
+            post_urls,
+            list((extraction_metadata or {}).get("post_cards") or []),
+            list((extraction_metadata or {}).get("payload_posts") or []),
+        )
+        result["posts"] = posts
+        result["coverage"] = _build_post_search_coverage(
+            posts,
+            post_urls,
+            extraction_metadata,
+            date_posted=date_posted,
+            sort_by=effective_sort,
+            max_pages=max_pages,
+        )
         if section_errors:
             result["section_errors"] = section_errors
         return result
@@ -3512,6 +5139,31 @@ class LinkedInExtractor:
                         };
                     })
                     .filter(Boolean);
+
+                const seenReferenceHrefs = new Set(
+                    references.map(reference => reference.href),
+                );
+                for (const post of container.querySelectorAll('[data-urn^="urn:li:activity:"]')) {
+                    const urn = (post.getAttribute('data-urn') || '').trim();
+                    if (!urn) {
+                        continue;
+                    }
+                    const href = `https://www.linkedin.com/feed/update/${urn}/`;
+                    if (seenReferenceHrefs.has(href)) {
+                        continue;
+                    }
+                    references.push({
+                        href,
+                        text: '',
+                        aria_label: '',
+                        title: '',
+                        heading: findHeading(post),
+                        in_article: Boolean(post.closest('article')),
+                        in_nav: Boolean(post.closest('nav')),
+                        in_footer: Boolean(post.closest('footer')),
+                    });
+                    seenReferenceHrefs.add(href);
+                }
 
                 return { source, text, references };
             }""",

@@ -18,6 +18,14 @@ from linkedin_mcp_server.scraping.extractor import (
     LinkedInExtractor,
     _RATE_LIMITED_MSG,
     _build_feed_references,
+    _build_post_search_coverage,
+    _build_post_search_references,
+    _build_structured_post_results,
+    _is_post_search_payload_response,
+    _oldest_post_search_age_hours,
+    _post_records_from_payload,
+    _post_urls_from_payload,
+    _relative_post_age_hours,
     _truncate_linkedin_noise,
     strip_linkedin_noise,
 )
@@ -28,9 +36,15 @@ def extracted(
     text: str,
     references: list[Reference] | None = None,
     error: dict | None = None,
+    metadata: dict | None = None,
 ) -> ExtractedSection:
     """Create an ExtractedSection for tests."""
-    return ExtractedSection(text=text, references=references or [], error=error)
+    return ExtractedSection(
+        text=text,
+        references=references or [],
+        error=error,
+        metadata=metadata,
+    )
 
 
 class TestBuildJobSearchUrl:
@@ -120,6 +134,30 @@ class TestBuildJobSearchUrl:
         assert "sortBy=DD" in url
 
 
+class TestBuildAIJobSearchKeywords:
+    def test_encodes_filters_as_natural_language(self):
+        keywords = LinkedInExtractor._build_ai_job_search_keywords(
+            "software engineer",
+            location="California",
+            experience_level="internship,entry",
+            work_type="remote",
+            sort_by="date",
+        )
+
+        assert keywords == (
+            "software engineer, in California, internship or entry level, "
+            "remote, sorted by most recent"
+        )
+
+    def test_remote_location_does_not_use_in_prefix(self):
+        keywords = LinkedInExtractor._build_ai_job_search_keywords(
+            "backend engineer",
+            location="Remote",
+        )
+
+        assert keywords == "backend engineer, remote"
+
+
 @pytest.fixture
 def mock_page():
     """Create a mock Patchright page."""
@@ -203,6 +241,8 @@ class TestExtractPage:
         assert "index < 3" in script
         assert "if (!rawHref || rawHref === '#')" in script
         assert ".slice(0, MAX_REFERENCE_ANCHORS)" in script
+        assert "querySelectorAll('[data-urn^=\"urn:li:activity:\"]')" in script
+        assert "https://www.linkedin.com/feed/update/${urn}/" in script
         assert "in_list" not in script
         assert ".filter(Boolean);" in script
 
@@ -1791,6 +1831,386 @@ class TestScrapeJob:
         assert result["sections"] == {}
         assert "references" not in result
 
+    async def test_job_save_button_state_uses_active_locale(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.evaluate = AsyncMock(side_effect=["en-US", "saved"])
+
+        result = await extractor._job_save_button_state()
+
+        assert result == "saved"
+        assert mock_page.evaluate.await_args_list[1].args[1] == {
+            "labels": {"saved": "Saved", "unsaved": "Save"}
+        }
+
+    async def test_job_save_button_state_rejects_unknown_locale(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.evaluate = AsyncMock(return_value="de-DE")
+
+        with pytest.raises(
+            LinkedInScraperException, match="not supported for browser locale"
+        ):
+            await extractor._job_save_button_state()
+
+    async def test_save_job_already_saved(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                extractor,
+                "_job_save_button_state",
+                new_callable=AsyncMock,
+                return_value="saved",
+            ),
+            patch.object(
+                extractor, "_click_job_save_button", new_callable=AsyncMock
+            ) as click_save,
+        ):
+            result = await extractor.save_job("12345")
+
+        assert result == {
+            "url": "https://www.linkedin.com/jobs/view/12345/",
+            "job_id": "12345",
+            "saved": True,
+            "already_saved": True,
+        }
+        click_save.assert_not_awaited()
+
+    async def test_save_job_clicks_save(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                extractor,
+                "_job_save_button_state",
+                new_callable=AsyncMock,
+                return_value="unsaved",
+            ),
+            patch.object(
+                extractor,
+                "_click_job_save_button",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as click_save,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.save_job("12345")
+
+        assert result["saved"] is True
+        assert result["already_saved"] is False
+        click_save.assert_awaited_once_with("unsaved")
+
+    async def test_save_job_raises_when_save_button_missing(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                extractor,
+                "_job_save_button_state",
+                new_callable=AsyncMock,
+                return_value="unsaved",
+            ),
+            patch.object(
+                extractor,
+                "_click_job_save_button",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            with pytest.raises(LinkedInScraperException):
+                await extractor.save_job("12345")
+
+    async def test_unsave_job_already_unsaved(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                extractor,
+                "_job_save_button_state",
+                new_callable=AsyncMock,
+                return_value="unsaved",
+            ),
+            patch.object(
+                extractor, "_click_job_save_button", new_callable=AsyncMock
+            ) as click_unsave,
+        ):
+            result = await extractor.unsave_job("12345")
+
+        assert result == {
+            "url": "https://www.linkedin.com/jobs/view/12345/",
+            "job_id": "12345",
+            "saved": False,
+            "already_unsaved": True,
+        }
+        click_unsave.assert_not_awaited()
+
+    async def test_unsave_job_clicks_saved_control(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                extractor,
+                "_job_save_button_state",
+                new_callable=AsyncMock,
+                return_value="saved",
+            ),
+            patch.object(
+                extractor,
+                "_click_job_save_button",
+                new_callable=AsyncMock,
+                return_value=True,
+            ) as click_unsave,
+            patch(
+                "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.unsave_job("12345")
+
+        assert result["saved"] is False
+        assert result["already_unsaved"] is False
+        click_unsave.assert_awaited_once_with("saved")
+
+    async def test_unsave_job_raises_when_saved_control_missing(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+            patch.object(
+                extractor,
+                "_job_save_button_state",
+                new_callable=AsyncMock,
+                return_value="saved",
+            ),
+            patch.object(
+                extractor,
+                "_click_job_save_button",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
+        ):
+            with pytest.raises(LinkedInScraperException):
+                await extractor.unsave_job("12345")
+
+
+class TestListSavedJobs:
+    """Tests for list_saved_jobs extraction and scroll-stable capture."""
+
+    def _patches(self, extractor, cards):
+        """Patches for list_saved_jobs: navigation, rate limit, scroll, cards."""
+        card_batches = list(cards)
+        extract = extractor._extract_saved_job_cards = AsyncMock(
+            side_effect=card_batches
+        )
+        scroll = extractor._scroll_main_scrollable_region = AsyncMock()
+        page_text = extractor.get_page_text = AsyncMock(
+            return_value="Saved jobs page text"
+        )
+        return extract, scroll, page_text
+
+    async def test_returns_all_cards_and_stops_when_stable(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        batch_one = [
+            {"job_id": "111", "card_text": "Job A"},
+            {"job_id": "222", "card_text": "Job B"},
+        ]
+        batch_two = [
+            {"job_id": "111", "card_text": "Job A"},
+            {"job_id": "222", "card_text": "Job B"},
+            {"job_id": "333", "card_text": "Job C"},
+        ]
+        # Two stale batches after the final card ends scrolling.
+        extract, scroll, _ = self._patches(
+            extractor, [batch_one, batch_two, batch_two, batch_two]
+        )
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.list_saved_jobs()
+
+        assert result["url"] == "https://www.linkedin.com/my-items/saved-jobs/"
+        assert result["job_ids"] == ["111", "222", "333"]
+        assert [job["job_id"] for job in result["jobs"]] == ["111", "222", "333"]
+        assert result["jobs"][0]["job_url"] == (
+            "https://www.linkedin.com/jobs/view/111/"
+        )
+        assert result["sections"] == {"saved_jobs": "Saved jobs page text"}
+        # One scroll per extraction round except the final stale round.
+        assert extract.await_count == 4
+        assert scroll.await_count == 3
+
+    async def test_keeps_first_snapshot_of_each_card(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        stable_batch = [
+            {"job_id": "111", "card_text": "second snapshot"},
+            {"job_id": "222", "card_text": "Job B"},
+        ]
+        extract, _, _ = self._patches(
+            extractor,
+            [
+                [{"job_id": "111", "card_text": "first snapshot"}],
+                stable_batch,
+                stable_batch,
+                stable_batch,
+            ],
+        )
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.list_saved_jobs()
+
+        # setdefault keeps the earliest snapshot; new IDs still append in order.
+        assert result["jobs"][0] == {
+            "job_id": "111",
+            "job_url": "https://www.linkedin.com/jobs/view/111/",
+            "card_text": "first snapshot",
+        }
+        assert result["job_ids"] == ["111", "222"]
+
+    async def test_empty_list_returns_empty_results(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        page_text = extractor.get_page_text = AsyncMock(return_value="")
+        extractor._extract_saved_job_cards = AsyncMock(return_value=[])
+        extractor._scroll_main_scrollable_region = AsyncMock()
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.list_saved_jobs()
+
+        assert result["job_ids"] == []
+        assert result["jobs"] == []
+        assert result["sections"] == {}
+        del page_text
+
+    async def test_max_scrolls_bounds_the_scroll_loop(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        # Every batch yields a brand-new ID, so scrolling never goes stale.
+        batches = [[{"job_id": str(n), "card_text": f"Job {n}"}] for n in range(1, 10)]
+        extractor._extract_saved_job_cards = AsyncMock(side_effect=batches)
+        extractor._scroll_main_scrollable_region = AsyncMock()
+        extractor.get_page_text = AsyncMock(return_value="Saved jobs")
+        scroll = extractor._scroll_main_scrollable_region
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.list_saved_jobs(max_scrolls=3)
+
+        assert len(result["job_ids"]) == 3
+        assert scroll.await_count == 3
+
+    async def test_follows_next_page_pagination(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        page_one = [
+            {"job_id": "111", "card_text": "Job A"},
+            {"job_id": "222", "card_text": "Job B"},
+        ]
+        page_two = [{"job_id": "333", "card_text": "Job C"}]
+        extractor._extract_saved_job_cards = AsyncMock(
+            side_effect=[page_one, page_one, page_one, page_two, page_two, page_two]
+        )
+        extractor._scroll_main_scrollable_region = AsyncMock()
+        extractor.get_page_text = AsyncMock(return_value="Saved jobs")
+        extractor._click_saved_jobs_next_page = AsyncMock(side_effect=[True, False])
+        extractor._saved_jobs_first_id = AsyncMock(return_value="111")
+        extractor._wait_for_saved_jobs_page_change = AsyncMock()
+        with (
+            patch.object(extractor, "_navigate_to_page", new_callable=AsyncMock),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.detect_rate_limit",
+                new_callable=AsyncMock,
+            ),
+            patch(
+                "linkedin_mcp_server.scraping.extractor.handle_modal_close",
+                new_callable=AsyncMock,
+            ),
+        ):
+            result = await extractor.list_saved_jobs(max_scrolls=25)
+
+        assert result["job_ids"] == ["111", "222", "333"]
+        assert extractor._click_saved_jobs_next_page.await_count == 2
+        extractor._wait_for_saved_jobs_page_change.assert_awaited_once()
+
 
 class TestSearchJobs:
     """Tests for search_jobs with job ID extraction and pagination."""
@@ -1798,6 +2218,90 @@ class TestSearchJobs:
     @pytest.fixture(autouse=True)
     def _set_search_url(self, mock_page):
         mock_page.url = "https://www.linkedin.com/jobs/search/?keywords=python"
+
+    async def test_extract_job_ids_supports_ai_result_cards(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        mock_page.evaluate = AsyncMock(return_value=["4452011985", "4452011986"])
+
+        result = await extractor._extract_job_ids()
+
+        assert result == ["4452011985", "4452011986"]
+        script = mock_page.evaluate.await_args.args[0]
+        assert "job-card-component-ref-" in script
+        assert 'a[href*="/jobs/view/"]' in script
+
+    async def test_ai_redirect_reissues_filters_in_query(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        urls_visited: list[str] = []
+
+        async def mock_extract(url, *args, **kwargs):
+            urls_visited.append(url)
+            if len(urls_visited) == 1:
+                mock_page.url = (
+                    "https://www.linkedin.com/jobs/search-results/"
+                    "?keywords=software+engineer&f_TPR=r86400"
+                )
+                return extracted("Phoenix results")
+            mock_page.url = url.replace("/jobs/search/?", "/jobs/search-results/?")
+            return extracted("California entry-level results")
+
+        with (
+            patch.object(extractor, "_extract_search_page", side_effect=mock_extract),
+            patch.object(
+                extractor,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=["4452011985"],
+            ),
+            patch.object(
+                extractor,
+                "_get_total_search_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+        ):
+            result = await extractor.search_jobs(
+                "software engineer",
+                location="California",
+                max_pages=1,
+                date_posted="past_24_hours",
+                experience_level="internship,entry",
+                sort_by="date",
+            )
+
+        assert len(urls_visited) == 2
+        assert "in+California" in urls_visited[1]
+        assert "internship+or+entry+level" in urls_visited[1]
+        assert "sorted+by+most+recent" in urls_visited[1]
+        assert result["job_ids"] == ["4452011985"]
+        assert result["search_mode"] == "ai"
+        assert result["requested_url"] == urls_visited[0]
+        assert result["sections"]["search_results"] == (
+            "California entry-level results"
+        )
+
+    async def test_ai_redirect_fails_when_fallback_query_is_discarded(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+
+        async def mock_extract(url, *args, **kwargs):
+            mock_page.url = (
+                "https://www.linkedin.com/jobs/search-results/"
+                "?keywords=software+engineer&f_TPR=r86400"
+            )
+            return extracted("Visible results")
+
+        with patch.object(extractor, "_extract_search_page", side_effect=mock_extract):
+            with pytest.raises(
+                LinkedInScraperException,
+                match="discarded requested search parameters.*keywords",
+            ):
+                await extractor.search_jobs(
+                    "software engineer",
+                    location="California",
+                    max_pages=1,
+                    date_posted="past_24_hours",
+                    experience_level="entry",
+                )
 
     async def test_returns_job_ids(self, mock_page):
         """search_jobs should return a job_ids list extracted from hrefs."""
@@ -2193,6 +2697,12 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
                 return_value=None,
             ),
+            patch.object(
+                extractor,
+                "_has_visible_job_cards",
+                new_callable=AsyncMock,
+                return_value=False,
+            ),
             patch(
                 "linkedin_mcp_server.scraping.extractor.asyncio.sleep",
                 new_callable=AsyncMock,
@@ -2203,8 +2713,42 @@ class TestSearchJobs:
         assert result["job_ids"] == []
         assert result["sections"]["search_results"] == "No matching jobs found"
 
-    async def test_url_redirect_skips_id_extraction(self, mock_page):
-        """Unexpected page URL should skip ID extraction but capture text."""
+    async def test_visible_cards_without_ids_raise(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with (
+            patch.object(
+                extractor,
+                "_extract_search_page",
+                new_callable=AsyncMock,
+                return_value=extracted("Visible job cards"),
+            ),
+            patch.object(
+                extractor,
+                "_extract_job_ids",
+                new_callable=AsyncMock,
+                return_value=[],
+            ),
+            patch.object(
+                extractor,
+                "_get_total_search_pages",
+                new_callable=AsyncMock,
+                return_value=None,
+            ),
+            patch.object(
+                extractor,
+                "_has_visible_job_cards",
+                new_callable=AsyncMock,
+                return_value=True,
+            ),
+        ):
+            with pytest.raises(
+                LinkedInScraperException,
+                match="displayed result cards but no job IDs",
+            ):
+                await extractor.search_jobs("python", max_pages=1)
+
+    async def test_unexpected_url_redirect_raises(self, mock_page):
+        """Unexpected page redirects should fail instead of returning zero IDs."""
         extractor = LinkedInExtractor(mock_page)
         mock_page.url = "https://www.linkedin.com/uas/login"
         with (
@@ -2234,16 +2778,13 @@ class TestSearchJobs:
                 new_callable=AsyncMock,
             ),
         ):
-            result = await extractor.search_jobs("python", max_pages=2)
+            with pytest.raises(
+                LinkedInScraperException,
+                match="redirected to an unexpected page",
+            ):
+                await extractor.search_jobs("python", max_pages=2)
 
         mock_ids.assert_not_awaited()
-        assert result["job_ids"] == []
-        assert result["sections"]["search_results"] == "Login page content"
-        assert result["references"] == {
-            "search_results": [
-                {"kind": "person", "url": "/in/testuser/", "text": "Test User"}
-            ]
-        }
 
     async def test_rate_limited_skips_ids_and_text(self, mock_page):
         """Rate-limited pages should yield no IDs or text."""
@@ -2277,6 +2818,104 @@ class TestSearchJobs:
         assert result["job_ids"] == []
         assert result["sections"] == {}
         mock_ids.assert_not_awaited()
+
+    async def test_search_posts_builds_content_search_url(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with patch.object(
+            extractor,
+            "extract_post_search",
+            new_callable=AsyncMock,
+            return_value=extracted(
+                "Post text",
+                [
+                    {
+                        "kind": "feed_post",
+                        "url": "/posts/alice_hiring-ugcPost-1-abc",
+                    },
+                    {"kind": "person", "url": "/in/alice/", "text": "Alice"},
+                ],
+            ),
+        ) as mock_extract:
+            result = await extractor.search_posts(
+                '"software engineer" AND (intern OR internship) AND hiring',
+                date_posted="past_week",
+                sort_by="date_posted",
+                max_pages=1,
+            )
+
+        assert result["url"].startswith(
+            "https://www.linkedin.com/search/results/content/?"
+        )
+        assert (
+            "keywords=%22software+engineer%22+AND+%28intern+OR+internship%29+AND+hiring"
+            in result["url"]
+        )
+        assert "origin=FACETED_SEARCH" in result["url"]
+        assert "datePosted=%5B%22past-week%22%5D" in result["url"]
+        assert "sortBy=%22date_posted%22" in result["url"]
+        assert result["sections"]["search_results"] == "Post text"
+        assert result["references"]["search_results"] == [
+            {"kind": "feed_post", "url": "/posts/alice_hiring-ugcPost-1-abc"},
+            {"kind": "person", "url": "/in/alice/", "text": "Alice"},
+        ]
+        assert result["post_urls"] == [
+            "https://www.linkedin.com/posts/alice_hiring-ugcPost-1-abc"
+        ]
+        mock_extract.assert_awaited_once()
+        await_args = mock_extract.await_args
+        assert await_args is not None
+        assert await_args.kwargs["max_scrolls"] == 1
+        assert await_args.kwargs["boundary_hours"] == 6 * 24
+
+    async def test_search_posts_uses_max_pages_as_scroll_budget(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+
+        with patch.object(
+            extractor,
+            "extract_post_search",
+            new_callable=AsyncMock,
+            return_value=extracted("Search result text"),
+        ) as mock_extract:
+            result = await extractor.search_posts("hiring", max_pages=2)
+
+        assert result["sections"]["search_results"] == "Search result text"
+        assert "sortBy=%22date_posted%22" in result["url"]
+        mock_extract.assert_awaited_once()
+        await_args = mock_extract.await_args
+        assert await_args is not None
+        assert await_args.kwargs["max_scrolls"] == 2
+
+    async def test_search_posts_rate_limited_surfaces_section_error(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with patch.object(
+            extractor,
+            "extract_post_search",
+            new_callable=AsyncMock,
+            return_value=extracted(_RATE_LIMITED_MSG),
+        ):
+            result = await extractor.search_posts("hiring", max_pages=1)
+
+        assert result["sections"] == {}
+        assert result["section_errors"]["search_results"]["error_type"] == "rate_limit"
+
+    async def test_search_posts_compact_mode_omits_raw_sections(self, mock_page):
+        extractor = LinkedInExtractor(mock_page)
+        with patch.object(
+            extractor,
+            "extract_post_search",
+            new_callable=AsyncMock,
+            return_value=extracted("Feed post\nAlice\n2h\nHiring an intern"),
+        ):
+            result = await extractor.search_posts(
+                "hiring",
+                max_pages=1,
+                include_raw=False,
+            )
+
+        assert "sections" not in result
+        assert "references" not in result
+        assert result["posts"][0]["author"] == "Alice"
+        assert result["post_urls"] == []
 
     async def test_search_people_omits_orphaned_references(self, mock_page):
         extractor = LinkedInExtractor(mock_page)
@@ -2384,6 +3023,566 @@ class TestSearchJobs:
         assert "location=Seattle" in result["url"]
         assert "network=%5B%22F%22%5D" in result["url"]
         assert "currentCompany=%5B%221115%22%5D" in result["url"]
+
+
+class TestPostSearchPermalinkCapture:
+    def test_relative_post_age_hours(self):
+        assert _relative_post_age_hours("15m •") == 0.25
+        assert _relative_post_age_hours("Reposted 23h • Edited") == 23
+        assert _relative_post_age_hours("1d •") == 24
+        assert _relative_post_age_hours("not a timestamp") is None
+
+    def test_structured_posts_preserve_full_text_and_pair_equal_streams(self):
+        body = "A" * 1200 + "\nApplications are open."
+        text = f"Feed post\n\nAlice Example\n\nSoftware recruiter\n\n23h •\n\n{body}\n"
+        references: list[Reference] = [
+            {
+                "kind": "feed_post",
+                "url": "/posts/alice-example_hiring-activity-123-abc",
+            },
+            {
+                "kind": "person",
+                "url": "/in/alice-example/",
+                "text": "Alice Example",
+            },
+        ]
+        posts = _build_structured_post_results(
+            text,
+            references,
+            ["https://www.linkedin.com/posts/alice-example_hiring-activity-123-abc"],
+        )
+
+        assert posts == [
+            {
+                "author": "Alice Example",
+                "author_profile_url": "https://www.linkedin.com/in/alice-example/",
+                "headline": "Software recruiter",
+                "relative_time": "23h",
+                "age_hours": 23,
+                "text": body,
+                "post_url": (
+                    "https://www.linkedin.com/posts/"
+                    "alice-example_hiring-activity-123-abc"
+                ),
+                "url_match": "ordered_one_to_one",
+            }
+        ]
+        assert len(posts[0]["text"]) > 900
+
+    def test_structured_posts_leave_ambiguous_url_unpaired(self):
+        text = (
+            "Feed post\n\nAlice Example\n\n2h •\n\nFirst post\n"
+            "Feed post\n\nBob Example\n\n3h •\n\nSecond post\n"
+        )
+        references: list[Reference] = [
+            {"kind": "person", "url": "/in/alice/", "text": "Alice Example"},
+            {"kind": "person", "url": "/in/bob/", "text": "Bob Example"},
+        ]
+        posts = _build_structured_post_results(
+            text,
+            references,
+            ["https://www.linkedin.com/posts/generic_hiring-activity-123-abc"],
+        )
+
+        assert [post["post_url"] for post in posts] == [None, None]
+        assert {post["url_match"] for post in posts} == {"not_exposed_or_unpaired"}
+
+    def test_structured_posts_use_unique_author_slug_when_streams_differ(self):
+        text = (
+            "Feed post\n\nAlice Example\n\n2h •\n\nFirst post\n"
+            "Feed post\n\nBob Example\n\n3h •\n\nSecond post\n"
+        )
+        references: list[Reference] = [
+            {
+                "kind": "person",
+                "url": "/in/alice-example/",
+                "text": "Alice Example",
+            },
+            {"kind": "person", "url": "/in/bob-example/", "text": "Bob Example"},
+        ]
+        url = "https://www.linkedin.com/posts/alice-example_hiring-activity-123-abc"
+        posts = _build_structured_post_results(text, references, [url])
+
+        assert posts[0]["post_url"] == url
+        assert posts[0]["url_match"] == "unique_author_slug"
+        assert posts[1]["post_url"] is None
+
+    def test_structured_posts_prefer_exact_dom_card_permalink(self):
+        text = (
+            "Feed post\n\nAlice Example\n\nRecruiter\n\n2h •\n\n"
+            "We are hiring a software engineering intern for our platform team.\n"
+            "Feed post\n\nBob Example\n\nFounder\n\n3h •\n\n"
+            "We are hiring a product design intern for our mobile team.\n"
+        )
+        alice_url = (
+            "https://www.linkedin.com/posts/alice-example_hiring-activity-123-abc"
+        )
+        posts = _build_structured_post_results(
+            text,
+            [
+                {
+                    "kind": "person",
+                    "url": "/in/alice-example/",
+                    "text": "Alice Example",
+                },
+                {
+                    "kind": "person",
+                    "url": "/in/bob-example/",
+                    "text": "Bob Example",
+                },
+            ],
+            [
+                alice_url,
+                "https://www.linkedin.com/posts/unassigned-activity-456-abc",
+                "https://www.linkedin.com/posts/unassigned-activity-789-abc",
+            ],
+            [
+                {
+                    "text": (
+                        "Alice Example\nRecruiter\n2h\n"
+                        "We are hiring a software engineering intern for our "
+                        "platform team.\nLike\nComment"
+                    ),
+                    "post_url": alice_url,
+                    "author_profile_url": (
+                        "https://www.linkedin.com/in/alice-example/"
+                    ),
+                    "url_source": "dom_permalink",
+                }
+            ],
+        )
+
+        assert posts[0]["post_url"] == alice_url
+        assert posts[0]["url_match"] == "dom_permalink"
+        assert posts[1]["post_url"] is None
+
+    def test_structured_posts_reject_ambiguous_duplicate_dom_text(self):
+        duplicate = "We are hiring interns for our platform team today."
+        text = (
+            f"Feed post\n\nAlice Example\n\n2h •\n\n{duplicate}\n"
+            f"Feed post\n\nAlice Example\n\n2h •\n\n{duplicate}\n"
+        )
+        posts = _build_structured_post_results(
+            text,
+            [],
+            ["https://www.linkedin.com/posts/alice-activity-123-abc"],
+            [
+                {
+                    "text": f"Alice Example\n2h\n{duplicate}",
+                    "post_url": (
+                        "https://www.linkedin.com/posts/alice-activity-123-abc"
+                    ),
+                    "url_source": "dom_activity_urn",
+                }
+            ],
+        )
+
+        assert [post["post_url"] for post in posts] == [None, None]
+
+    def test_structured_posts_pair_unique_payload_actor_names(self):
+        text = (
+            "Feed post\n\nSunny Yadav\n\n2h •\n\nAndroid internship opening.\n"
+            "Feed post\n\nNext Job Post\n\n3h •\n\nFull-stack internship opening.\n"
+        )
+        sunny_url = "https://www.linkedin.com/posts/sunny-activity-123-abc"
+        next_job_url = "https://www.linkedin.com/posts/next-job-activity-456-abc"
+        posts = _build_structured_post_results(
+            text,
+            [],
+            [sunny_url, next_job_url, "https://www.linkedin.com/posts/orphan"],
+            [],
+            [
+                {"post_url": sunny_url, "actor_name": "Sunny"},
+                {"post_url": next_job_url, "actor_name": "Next Job"},
+            ],
+        )
+
+        assert [post["post_url"] for post in posts] == [sunny_url, next_job_url]
+        assert {post["url_match"] for post in posts} == {"payload_actor_name"}
+
+    def test_structured_posts_pair_only_equal_payload_segments_between_anchors(self):
+        text = "".join(
+            f"Feed post\n\n{name}\n\n{index}h •\n\nPost body for {name} role.\n"
+            for index, name in enumerate(
+                ["Anchor One", "Middle A", "Middle B", "Anchor Two", "Unpaired"],
+                start=1,
+            )
+        )
+        payload_posts = [
+            {
+                "post_url": "https://www.linkedin.com/posts/one",
+                "actor_name": "Anchor One",
+            },
+            {"post_url": "https://www.linkedin.com/posts/a", "actor_name": "Unknown A"},
+            {"post_url": "https://www.linkedin.com/posts/b", "actor_name": "Unknown B"},
+            {
+                "post_url": "https://www.linkedin.com/posts/two",
+                "actor_name": "Anchor Two",
+            },
+        ]
+        posts = _build_structured_post_results(
+            text,
+            [],
+            [post["post_url"] for post in payload_posts],
+            [],
+            payload_posts,
+        )
+
+        assert [post["url_match"] for post in posts[:4]] == [
+            "payload_actor_name",
+            "bounded_ordered_payload",
+            "bounded_ordered_payload",
+            "payload_actor_name",
+        ]
+        assert posts[4]["post_url"] is None
+
+    def test_coverage_reports_time_boundary_and_pairing_gaps(self):
+        posts = [
+            {
+                "relative_time": "23h",
+                "age_hours": 23,
+                "post_url": "https://www.linkedin.com/posts/a",
+            },
+            {
+                "relative_time": "4h",
+                "age_hours": 4,
+                "post_url": None,
+            },
+        ]
+        coverage = _build_post_search_coverage(
+            posts,
+            ["https://www.linkedin.com/posts/a"],
+            {
+                "scroll": {
+                    "attempts": 50,
+                    "stop_reason": "max_scrolls",
+                    "end_reached": False,
+                }
+            },
+            date_posted="past_24_hours",
+            sort_by="date_posted",
+            max_pages=50,
+        )
+
+        assert coverage["status"] == "time_window_boundary_reached"
+        assert coverage["time_window_boundary_reached"] is True
+        assert coverage["oldest_age_hours"] == 23
+        assert coverage["paired_post_count"] == 1
+        assert coverage["unpaired_post_count"] == 1
+        assert coverage["exhaustiveness_guaranteed"] is False
+
+    def test_coverage_uses_observed_boundary_stop_evidence(self):
+        coverage = _build_post_search_coverage(
+            [],
+            [],
+            {
+                "scroll": {
+                    "attempts": 12,
+                    "stop_reason": "time_window_boundary",
+                },
+                "observed_oldest_age_hours": 23,
+            },
+            date_posted="past_24_hours",
+            sort_by="date_posted",
+            max_pages=100,
+        )
+
+        assert coverage["status"] == "time_window_boundary_reached"
+        assert coverage["time_window_boundary_reached"] is True
+        assert coverage["oldest_age_hours"] == 23
+
+    def test_coverage_treats_stable_bottom_as_incomplete_evidence(self):
+        coverage = _build_post_search_coverage(
+            [
+                {
+                    "relative_time": "19h",
+                    "age_hours": 19,
+                    "post_url": None,
+                    "url_match": "not_exposed_or_unpaired",
+                }
+            ],
+            ["https://www.linkedin.com/posts/unassigned"],
+            {
+                "scroll": {
+                    "attempts": 20,
+                    "bottom_retries": 2,
+                    "stop_reason": "stable_bottom",
+                    "stable_bottom_reached": True,
+                    "explicit_end_marker_seen": False,
+                }
+            },
+            date_posted="past_24_hours",
+            sort_by="date_posted",
+            max_pages=100,
+        )
+
+        assert coverage["status"] == "stable_bottom_before_boundary"
+        assert coverage["completion_evidence"] == "stable_bottom_only"
+        assert coverage["stable_bottom_reached"] is True
+        assert coverage["visible_results_exhausted"] is False
+        assert coverage["explicit_end_marker_seen"] is False
+        assert coverage["bottom_retry_count"] == 2
+        assert coverage["dom_card_permalink_evidence_count"] == 0
+        assert coverage["payload_actor_permalink_evidence_count"] == 0
+        assert coverage["unassigned_canonical_url_count"] == 1
+        assert any("stable bottom" in warning for warning in coverage["warnings"])
+        assert any("date boundary" in warning for warning in coverage["warnings"])
+
+    def test_payload_response_filter_accepts_search_and_voyager(self):
+        assert _is_post_search_payload_response(
+            "https://www.linkedin.com/search/results/content/?keywords=hiring"
+        )
+        assert _is_post_search_payload_response(
+            "https://www.linkedin.com/voyager/api/graphql?variables=search"
+        )
+        assert not _is_post_search_payload_response(
+            "https://example.com/voyager/api/graphql"
+        )
+        assert not _is_post_search_payload_response(
+            "https://www.linkedin.com/in/alice/"
+        )
+
+    def test_extracts_plain_and_escaped_post_permalinks(self):
+        payload = r"""
+            {"postSlugUrl":"https://www.linkedin.com/posts/alice_hiring-activity-123-abc"}
+            {"postSlugUrl":"https:\/\/www.linkedin.com\/posts\/bob_role-ugcPost-456-def"}
+            {"url":"https:\u002f\u002fwww.linkedin.com\u002ffeed\u002fupdate\u002furn:li:activity:789"}
+        """
+        assert _post_urls_from_payload(payload) == [
+            "https://www.linkedin.com/posts/alice_hiring-activity-123-abc",
+            "https://www.linkedin.com/posts/bob_role-ugcPost-456-def",
+            "https://www.linkedin.com/feed/update/urn:li:activity:789/",
+        ]
+
+    def test_extracts_ordered_payload_actor_permalink_records(self):
+        payload = r"""
+            {"actorName":"Sunny","postSlugUrl":
+             "https://www.linkedin.com/posts/sunny_hiring-activity-123-abc"}
+            {"actorName":"Next Job\u2019s Team","postSlugUrl":
+             "https:\/\/www.linkedin.com\/posts\/next-job_role-share-456-def"}
+        """
+
+        assert _post_records_from_payload(payload) == [
+            {
+                "post_url": (
+                    "https://www.linkedin.com/posts/sunny_hiring-activity-123-abc"
+                ),
+                "actor_name": "Sunny",
+            },
+            {
+                "post_url": (
+                    "https://www.linkedin.com/posts/next-job_role-share-456-def"
+                ),
+                "actor_name": "Next Job’s Team",
+            },
+        ]
+
+    def test_extracts_actor_profile_from_payload_when_linked_to_actor(self):
+        payload = r"""
+            {"actorName":"Sunny",
+             "actorNavigationUrl":"https:\/\/www.linkedin.com\/in\/sunny-example\/",
+             "postSlugUrl":
+             "https://www.linkedin.com/posts/sunny_hiring-activity-123-abc"}
+        """
+
+        assert _post_records_from_payload(payload) == [
+            {
+                "post_url": (
+                    "https://www.linkedin.com/posts/sunny_hiring-activity-123-abc"
+                ),
+                "actor_name": "Sunny",
+                "actor_profile_url": "https://www.linkedin.com/in/sunny-example/",
+            }
+        ]
+
+    def test_oldest_post_search_age_ignores_non_card_chrome(self):
+        text = (
+            "Navigation\n1w\n"
+            "Feed post\nAlice\n2h •\nHiring\n"
+            "Feed post\nBob\n23h •\nApply now\n"
+        )
+
+        assert _oldest_post_search_age_hours(text) == 23
+
+    def test_search_references_prioritize_posts_without_losing_authors(self):
+        references: list[Reference] = [
+            {"kind": "person", "url": "/in/alice/", "text": "Alice"},
+            {
+                "kind": "feed_post",
+                "url": "/feed/update/urn:li:activity:111/",
+            },
+        ]
+        captured = ["https://www.linkedin.com/posts/alice_hiring-activity-222-abc"]
+        assert _build_post_search_references(references, captured) == [
+            {
+                "kind": "feed_post",
+                "url": "/feed/update/urn:li:activity:111/",
+            },
+            {
+                "kind": "feed_post",
+                "url": "/posts/alice_hiring-activity-222-abc",
+                "context": "search result",
+            },
+            {"kind": "person", "url": "/in/alice/", "text": "Alice"},
+        ]
+
+    def test_search_references_preserve_more_than_old_hundred_post_cap(self):
+        captured = [
+            f"https://www.linkedin.com/posts/author_role-activity-{index}-abc"
+            for index in range(150)
+        ]
+
+        references = _build_post_search_references([], captured)
+
+        assert len(references) == 150
+        assert all(reference["kind"] == "feed_post" for reference in references)
+
+    async def test_listener_merges_payload_permalink(self, mock_page):
+        class Response:
+            url = "https://www.linkedin.com/voyager/api/graphql?variables=search"
+
+            async def body(self):
+                return (
+                    b'{"actorName":"Alice","postSlugUrl":'
+                    b'"https://www.linkedin.com/posts/'
+                    b'alice_hiring-activity-123-abc"}'
+                )
+
+        extractor = LinkedInExtractor(mock_page)
+
+        async def extract_page(*args, **kwargs):
+            handler = mock_page.on.call_args.args[1]
+            handler(Response())
+            return extracted(
+                "Post text",
+                [{"kind": "person", "url": "/in/alice/", "text": "Alice"}],
+                metadata={
+                    "scroll": {
+                        "attempts": 2,
+                        "stop_reason": "max_scrolls",
+                        "end_reached": False,
+                    }
+                },
+            )
+
+        with patch.object(extractor, "extract_page", side_effect=extract_page):
+            result = await extractor.extract_post_search(
+                "https://www.linkedin.com/search/results/content/?keywords=hiring",
+                max_scrolls=2,
+            )
+
+        assert result.references[0] == {
+            "kind": "feed_post",
+            "url": "/posts/alice_hiring-activity-123-abc",
+            "context": "search result",
+        }
+        assert result.metadata == {
+            "scroll": {
+                "attempts": 2,
+                "stop_reason": "max_scrolls",
+                "end_reached": False,
+            },
+            "post_cards": [],
+            "dom_card_permalink_count": 0,
+            "payload_posts": [
+                {
+                    "post_url": (
+                        "https://www.linkedin.com/posts/alice_hiring-activity-123-abc"
+                    ),
+                    "actor_name": "Alice",
+                }
+            ],
+            "payload_actor_permalink_count": 1,
+            "observed_oldest_age_hours": None,
+        }
+        mock_page.remove_listener.assert_called_once()
+
+    async def test_scroll_observer_preserves_dom_card_permalink(self, mock_page):
+        post_url = (
+            "https://www.linkedin.com/posts/alice-example_hiring-activity-123-abc"
+        )
+        extractor = LinkedInExtractor(mock_page)
+
+        async def extract_page(*args, **kwargs):
+            await kwargs["observation_callback"]()
+            return extracted(
+                "Feed post\n\nAlice Example\n\n2h •\n\n"
+                "We are hiring a software engineering intern.\n",
+                [
+                    {
+                        "kind": "person",
+                        "url": "/in/alice-example/",
+                        "text": "Alice Example",
+                    }
+                ],
+                metadata={
+                    "scroll": {
+                        "attempts": 1,
+                        "stop_reason": "max_scrolls",
+                    }
+                },
+            )
+
+        with (
+            patch.object(extractor, "extract_page", side_effect=extract_page),
+            patch.object(
+                extractor,
+                "_extract_post_search_dom_cards",
+                new_callable=AsyncMock,
+                return_value=[
+                    {
+                        "text": (
+                            "Alice Example\n2h\n"
+                            "We are hiring a software engineering intern."
+                        ),
+                        "post_url": post_url,
+                        "author_profile_url": (
+                            "https://www.linkedin.com/in/alice-example/"
+                        ),
+                        "url_source": "dom_permalink",
+                    }
+                ],
+            ),
+        ):
+            result = await extractor.extract_post_search(
+                "https://www.linkedin.com/search/results/content/?keywords=hiring",
+                max_scrolls=1,
+            )
+
+        assert result.metadata is not None
+        assert result.metadata["dom_card_permalink_count"] == 1
+        assert result.metadata["post_cards"][0]["post_url"] == post_url
+        assert result.references[0]["url"] == (
+            "/posts/alice-example_hiring-activity-123-abc"
+        )
+
+    async def test_dom_card_capture_uses_structural_permalink_evidence(self, mock_page):
+        mock_page.evaluate = AsyncMock(
+            return_value=[
+                {
+                    "text": "Alice Example\n2h\nWe are hiring an intern.",
+                    "post_url": (
+                        "https://www.linkedin.com/feed/update/urn:li:activity:123/"
+                    ),
+                    "author_profile_url": (
+                        "https://www.linkedin.com/in/alice-example/"
+                    ),
+                    "url_source": "dom_activity_urn",
+                }
+            ]
+        )
+        extractor = LinkedInExtractor(mock_page)
+
+        cards = await extractor._extract_post_search_dom_cards()
+
+        assert cards[0]["url_source"] == "dom_activity_urn"
+        await_args = mock_page.evaluate.await_args
+        assert await_args is not None
+        script = await_args.args[0]
+        assert 'a[href*="/posts/"]' in script
+        assert '[data-urn*="urn:li:activity:"]' in script
+        assert "querySelector('main')" in script
+        assert "Feed post" not in script
 
 
 class TestStripLinkedInNoise:

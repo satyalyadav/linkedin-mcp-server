@@ -19,6 +19,7 @@ from linkedin_mcp_server.bootstrap import (
 from linkedin_mcp_server.config.schema import DEFAULT_TOOL_TIMEOUT_SECONDS
 from linkedin_mcp_server.drivers.browser import close_browser
 from linkedin_mcp_server.error_handler import raise_tool_error
+from linkedin_mcp_server.response_cache import profile_result_cache
 from linkedin_mcp_server.sequential_tool_middleware import (
     SequentialToolExecutionMiddleware,
 )
@@ -73,6 +74,7 @@ def create_mcp_server(*, tool_timeout: float = DEFAULT_TOOL_TIMEOUT_SECONDS) -> 
     async def close_session() -> dict[str, Any]:
         """Close the current browser session and clean up resources."""
         try:
+            profile_result_cache.clear()
             await close_browser()
             return {
                 "status": "success",
