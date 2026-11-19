@@ -99,7 +99,7 @@ Use code <strong>FOUNDING20</strong> for 20% off your first year. <a href="https
 | `get_company_employees` | Find company employees, optionally filtered by name, title, or skill. |
 | `search_jobs` | Find job postings by keyword and location, with job IDs for reading details. |
 | `get_saved_jobs` | List your saved job postings, with job IDs for looking up their details. |
-| `list_saved_jobs` | List saved jobs with job IDs and ready-to-use posting links. |
+| `list_saved_jobs` | List saved jobs with card text, job IDs and posting links. |
 | `save_job` | Save a LinkedIn job posting and report whether it was already saved. |
 | `unsave_job` | Remove a saved job posting and report whether it was already unsaved. |
 | `dismiss_job` | Dismiss a job from job search so later searches no longer show it. Irreversible. |

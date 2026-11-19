@@ -110,7 +110,7 @@
     },
     {
       "name": "list_saved_jobs",
-      "description": "List saved LinkedIn jobs with job IDs and ready-to-use posting links"
+      "description": "List saved LinkedIn jobs with card text, job IDs and posting links"
     },
     {
       "name": "dismiss_job",

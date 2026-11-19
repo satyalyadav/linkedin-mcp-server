@@ -1490,6 +1490,23 @@ class TestExtractSavedJobsPage:
         assert capture.section.references[-1]["url"] == "/jobs/view/711/"
 
 
+class TestSavedJobCards:
+    async def test_reads_card_text_by_job_id(self, mock_page):
+        mock_page.evaluate = AsyncMock(
+            return_value=[
+                {"job_id": "111", "card_text": "Job 111\nAcme"},
+                {"job_id": "222", "card_text": "Job 222\nBeta"},
+                {"job_id": 333, "card_text": "ignored"},
+            ]
+        )
+        reader = _reader(mock_page)
+
+        assert await reader.saved_job_cards() == [
+            {"job_id": "111", "card_text": "Job 111\nAcme"},
+            {"job_id": "222", "card_text": "Job 222\nBeta"},
+        ]
+
+
 class TestExtractJobIds:
     async def test_a_missing_rail_is_reported_not_silent(self, mock_page, caplog):
         """Reading the document is the fallback, and it has to be audible.

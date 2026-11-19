@@ -158,7 +158,7 @@ Optional additional keys:
 - `dismiss_job` returns no `sections`: `{url, job_id, keywords, dismissed: true, already_dismissed}`, where `url` is the worldwide search for `keywords`, the title and company its posting names
 - `save_job` returns no `sections`: `{url, job_id, saved: true, already_saved}`; anything else raises
 - `unsave_job` returns no `sections`: `{url, job_id, saved: false, already_unsaved}`; anything else raises
-- `list_saved_jobs` returns `{url, sections: {saved_jobs: text}, job_ids, jobs: [{job_id, job_url}]}` from the saved tab of the jobs tracker
+- `list_saved_jobs` returns `{url, sections: {saved_jobs: text}, job_ids, jobs: [{job_id, job_url, card_text}]}` from the saved tab of the jobs tracker
 - `form: {steps: [{heading?, progress?, fields: [{label, type, required, options?, options_total?, selected?, value?, max_length?, error?}]}], complete}` (get_easy_apply_form, which returns `apply: {type}` beside it and no `sections`) — present for Easy Apply postings only; `complete` is false when steps after the last one were not read, and `error` marks the fields LinkedIn refused on that step
 
 A failed call is an error result whose `_meta["linkedin.dev/error"]` is `{v, code, retry_after?}`. `ErrorCode` in `error_handler.py` is the closed set. Raise a failure through `raise_tool_error` or as `CodedToolError`, and build an error result the server returns instead of raising with `error_result`; a bare `ToolError` reads as `internal`.

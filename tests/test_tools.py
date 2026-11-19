@@ -1752,10 +1752,12 @@ class TestJobTools:
                 {
                     "job_id": "111",
                     "job_url": "https://www.linkedin.com/jobs/view/111/",
+                    "card_text": "Saved Job 1\nAcme",
                 },
                 {
                     "job_id": "222",
                     "job_url": "https://www.linkedin.com/jobs/view/222/",
+                    "card_text": "Saved Job 2\nBeta",
                 },
             ],
         }

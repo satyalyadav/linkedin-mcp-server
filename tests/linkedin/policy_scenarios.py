@@ -609,6 +609,13 @@ async def _list_saved_jobs_scenario() -> dict[str, Any]:
         ),
     )
     page.script("evaluate:saved_job_total_pages", 1)
+    page.script(
+        "evaluate:saved_job_cards",
+        [
+            {"job_id": "111", "card_text": "Job 111\nAcme"},
+            {"job_id": "222", "card_text": "Job 222\nBeta"},
+        ],
+    )
     page.script("evaluate:job_ids", {"ids": ["111", "222"], "scoped": False})
     extractor = _extractor(page)
     async with boundaries(recorder, clock):

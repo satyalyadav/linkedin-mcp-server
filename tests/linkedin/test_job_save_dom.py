@@ -25,6 +25,7 @@ from linkedin_mcp_server.linkedin.job_pages import (
     JobPageReader,
     _JOB_SAVE_CLICK_JS,
     _JOB_SAVE_STATE_JS,
+    _SAVED_JOB_CARDS_JS,
 )
 from linkedin_mcp_server.linkedin.navigation import PageNavigator
 from linkedin_mcp_server.linkedin.session import PageSession
@@ -448,3 +449,29 @@ class TestJobSaveTransitionOnPosting:
             await asyncio.wait_for(
                 reader.save_control_state(wait_for="saved"), timeout=2
             )
+
+
+class TestSavedJobCardsJs:
+    async def test_reads_each_cards_text_by_job_id(self, dom_page):
+        await dom_page.set_content(
+            _page_html(
+                """
+<main>
+  <section>
+    <a href="https://www.linkedin.com/jobs/view/111/">Senior Platform Engineer</a>
+    <p>Acme · Remote · Posted 2 days ago</p>
+  </section>
+  <section>
+    <a href="https://www.linkedin.com/jobs/view/222/">Staff Data Engineer</a>
+    <p>Beta · Hybrid · Posted 1 week ago</p>
+  </section>
+</main>
+"""
+            )
+        )
+        cards = await dom_page.evaluate(_SAVED_JOB_CARDS_JS)
+        assert [card["job_id"] for card in cards] == ["111", "222"]
+        assert "Senior Platform Engineer" in cards[0]["card_text"]
+        assert "Acme" in cards[0]["card_text"]
+        assert "Staff Data Engineer" in cards[1]["card_text"]
+        assert "Beta" in cards[1]["card_text"]

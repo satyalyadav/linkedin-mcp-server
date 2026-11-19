@@ -215,20 +215,24 @@ class JobReader:
         }
 
     async def list_saved_jobs(self, max_pages: int = 3) -> dict[str, Any]:
-        """List saved jobs with both tracker text and per-job permalinks.
+        """List saved jobs with tracker text, permalinks and per-card text.
 
         This is the local list view over the same tracker page ``get_saved_jobs``
-        reads. ``jobs`` is built from the tracker's job IDs so callers can pass
-        each ID to ``get_job_details``, ``save_job`` or ``unsave_job`` without
+        reads. Each entry in ``jobs`` carries the card text LinkedIn rendered
+        for that posting, so callers can present the saved list without
         parsing ``sections`` themselves.
         """
-        result = await self.get_saved_jobs(max_pages=max_pages, stage="saved")
+        cards: dict[str, dict[str, str]] = {}
+        result = await self.get_saved_jobs(
+            max_pages=max_pages, stage="saved", _cards=cards
+        )
         job_ids = result.get("job_ids")
         if isinstance(job_ids, list):
             result["jobs"] = [
                 {
                     "job_id": job_id,
                     "job_url": job_view_url(job_id, "/"),
+                    "card_text": cards.get(job_id, {}).get("card_text", ""),
                 }
                 for job_id in job_ids
                 if isinstance(job_id, str)
@@ -767,7 +771,11 @@ class JobReader:
         return organic == 0
 
     async def get_saved_jobs(
-        self, max_pages: int = 3, stage: JobsTrackerStage = "saved"
+        self,
+        max_pages: int = 3,
+        stage: JobsTrackerStage = "saved",
+        *,
+        _cards: dict[str, dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """List the authenticated user's jobs at one job-tracker stage.
 
@@ -908,6 +916,15 @@ class JobReader:
                         page_num * SAVED_JOBS_PAGE_SIZE, landed_url
                     )
                     break
+
+                if _cards is not None:
+                    try:
+                        for card in await self._pages.saved_job_cards():
+                            _cards.setdefault(card["job_id"], card)
+                    except Exception as e:
+                        # Card text is an enrichment; the page text and IDs
+                        # above are still the account's saved jobs.
+                        logger.debug("Could not read saved-job card text: %s", e)
 
                 page_ids = await self._pages._extract_job_ids()
                 new_ids = [jid for jid in page_ids if jid not in seen_ids]

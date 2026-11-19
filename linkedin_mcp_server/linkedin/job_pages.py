@@ -300,6 +300,40 @@ _JOB_SAVE_CLICK_JS = (
 }"""
 )
 
+# Saved-job cards on the tracker's saved tab. A card is the largest ancestor of
+# the posting's own `/jobs/view/<id>` link that still holds exactly one such
+# link, found structurally so no LinkedIn class name or localized label is
+# involved. The first link per job wins, which keeps the card's title anchor
+# rather than a duplicate link elsewhere in the card.
+_SAVED_JOB_CARDS_JS = r"""() => {
+    const main = document.querySelector('main') || document.body;
+    const jobIdFromHref = (href) => {
+        const match = (href || '').match(/\/jobs\/view\/(\d+)/);
+        return match ? match[1] : null;
+    };
+    const jobLinkCount = (element) =>
+        element.querySelectorAll('a[href*="/jobs/view/"]').length;
+    const byId = new Map();
+    for (const anchor of main.querySelectorAll('a[href*="/jobs/view/"]')) {
+        const jobId = jobIdFromHref(anchor.getAttribute('href'));
+        if (!jobId || byId.has(jobId)) continue;
+        let current = anchor;
+        let best = null;
+        while (current && current !== main.parentElement) {
+            if (jobLinkCount(current) > 1) break;
+            const text = (current.innerText || '').trim();
+            if (text.length >= 40) best = current;
+            current = current.parentElement;
+        }
+        const card = best || anchor;
+        byId.set(jobId, {
+            job_id: jobId,
+            card_text: (card.innerText || '').trim().slice(0, 600),
+        });
+    }
+    return Array.from(byId.values());
+}"""
+
 # This posting's apply control and state, once they render. Easy Apply comes in
 # two shapes. The anchor into the posting's own `/apply/` route
 # (`<a href=".../jobs/view/<id>/apply/?openSDUIApplyFlow=true">`, measured on
@@ -1343,6 +1377,21 @@ class JobPageReader:
             return None
         match = re.search(r"of\s+(\d+)", text)
         return int(match.group(1)) if match else None
+
+    async def saved_job_cards(self) -> list[dict[str, str]]:
+        """Read saved-job card text keyed by job ID from the current page."""
+        raw = await self._session.run_on_linkedin(_SAVED_JOB_CARDS_JS)
+        if not isinstance(raw, list):
+            return []
+        cards: list[dict[str, str]] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            job_id = item.get("job_id")
+            card_text = item.get("card_text")
+            if isinstance(job_id, str) and isinstance(card_text, str):
+                cards.append({"job_id": job_id, "card_text": card_text})
+        return cards
 
     async def _extract_saved_jobs_page(
         self,

@@ -339,7 +339,7 @@ def register_job_tools(
         max_pages: Annotated[int, Field(ge=1, le=10)] = 3,
     ) -> dict[str, Any]:
         """
-        List saved LinkedIn jobs with job IDs and per-job permalinks.
+        List saved LinkedIn jobs with card text, job IDs and permalinks.
 
         This is the saved-jobs list view over the same tracker page as
         get_saved_jobs, with a ready-to-use jobs array.
@@ -350,7 +350,7 @@ def register_job_tools(
 
         Returns:
             Dict with url, sections, job_ids, and jobs:
-            [{job_id, job_url}] in tracker order.
+            [{job_id, job_url, card_text}] in tracker order.
         """
         extractor = await get_ready_extractor(ctx, tool_name="list_saved_jobs")
         logger.info("Listing saved jobs (max_pages=%d)", max_pages)

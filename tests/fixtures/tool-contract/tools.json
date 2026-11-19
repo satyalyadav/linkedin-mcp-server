@@ -724,7 +724,7 @@
       "openWorldHint": true,
       "readOnlyHint": true
     },
-    "description": "List saved LinkedIn jobs with job IDs and per-job permalinks.\n\nThis is the saved-jobs list view over the same tracker page as\nget_saved_jobs, with a ready-to-use jobs array.",
+    "description": "List saved LinkedIn jobs with card text, job IDs and permalinks.\n\nThis is the saved-jobs list view over the same tracker page as\nget_saved_jobs, with a ready-to-use jobs array.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {

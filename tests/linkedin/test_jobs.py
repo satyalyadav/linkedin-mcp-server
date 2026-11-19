@@ -335,18 +335,33 @@ class TestUnsaveJob:
 
 
 class TestListSavedJobs:
-    async def test_adds_permalinks_to_the_tracker_result(self, mock_page):
+    async def test_adds_permalinks_and_card_text_to_the_tracker_result(self, mock_page):
         reader = _reader(mock_page)
         tracker = {
             "url": "https://www.linkedin.com/jobs-tracker/?stage=saved",
             "sections": {"saved_jobs": "Saved Job 1\nSaved Job 2"},
             "job_ids": ["111", "222"],
         }
+
+        async def fake_get_saved_jobs(*, max_pages, stage, _cards):
+            assert max_pages == 2
+            assert stage == "saved"
+            _cards.update(
+                {
+                    "111": {
+                        "job_id": "111",
+                        "card_text": "Saved Job 1\nAcme",
+                    },
+                    "222": {
+                        "job_id": "222",
+                        "card_text": "Saved Job 2\nBeta",
+                    },
+                }
+            )
+            return dict(tracker)
+
         with patch.object(
-            reader,
-            "get_saved_jobs",
-            new_callable=AsyncMock,
-            return_value=dict(tracker),
+            reader, "get_saved_jobs", side_effect=fake_get_saved_jobs
         ) as get_saved:
             result = await reader.list_saved_jobs(max_pages=2)
 
@@ -356,14 +371,16 @@ class TestListSavedJobs:
                 {
                     "job_id": "111",
                     "job_url": "https://www.linkedin.com/jobs/view/111/",
+                    "card_text": "Saved Job 1\nAcme",
                 },
                 {
                     "job_id": "222",
                     "job_url": "https://www.linkedin.com/jobs/view/222/",
+                    "card_text": "Saved Job 2\nBeta",
                 },
             ],
         }
-        get_saved.assert_awaited_once_with(max_pages=2, stage="saved")
+        get_saved.assert_awaited_once()
 
 
 class TestReadJob:

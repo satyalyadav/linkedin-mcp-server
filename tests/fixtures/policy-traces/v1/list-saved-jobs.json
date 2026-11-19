@@ -138,6 +138,13 @@
       "section": "saved_jobs"
     },
     {
+      "call": "list_saved_jobs",
+      "kind": "evaluate",
+      "operation": "saved_job_cards",
+      "program_digest": "2f365ac0d1b4",
+      "section": "saved_jobs"
+    },
+    {
       "arg": {
         "scoped": false,
         "selector": "a[href*=\"/jobs/view/\"], [componentkey^=\"job-card-component-ref-\"]"
@@ -156,10 +163,12 @@
     ],
     "jobs": [
       {
+        "card_text": "Job 111\nAcme",
         "job_id": "111",
         "job_url": "https://www.linkedin.com/jobs/view/111/"
       },
       {
+        "card_text": "Job 222\nBeta",
         "job_id": "222",
         "job_url": "https://www.linkedin.com/jobs/view/222/"
       }

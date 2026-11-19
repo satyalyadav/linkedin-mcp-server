@@ -167,7 +167,7 @@ class LinkedInExtractor:
         return await self._jobs.unsave_job(job_id)
 
     async def list_saved_jobs(self, max_pages: int = 3) -> dict[str, Any]:
-        """List saved jobs with job IDs and per-job permalinks."""
+        """List saved jobs with card text, job IDs and per-job permalinks."""
         return await self._jobs.list_saved_jobs(max_pages)
 
     async def get_job_apply_url(self, job_id: str) -> dict[str, Any]:
