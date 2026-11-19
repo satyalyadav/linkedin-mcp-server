@@ -116,6 +116,12 @@ def serve_extractor(monkeypatch: pytest.MonkeyPatch) -> Callable[[Any], AsyncMoc
             "numeric LinkedIn geo URN id",
         ),
         (
+            "person",
+            "search_people",
+            {"keywords": "", "connection_of": "williamhgates"},
+            "LinkedIn profile id",
+        ),
+        (
             "company",
             "get_company_profile",
             {"company_name": "/feed/"},
@@ -144,6 +150,42 @@ def serve_extractor(monkeypatch: pytest.MonkeyPatch) -> Callable[[Any], AsyncMoc
             "get_job_apply_url",
             {"job_id": "/feed/"},
             "job_id is not a LinkedIn id",
+        ),
+        (
+            "job",
+            "get_easy_apply_form",
+            {"job_id": "/feed/"},
+            "job_id is not a LinkedIn id",
+        ),
+        (
+            "job",
+            "dismiss_job",
+            {"job_id": "/feed/"},
+            "job_id is not a LinkedIn id",
+        ),
+        (
+            "post",
+            "search_posts",
+            {"keywords": "python", "date_posted": "last-year"},
+            "Invalid date_posted",
+        ),
+        (
+            "post",
+            "search_posts",
+            {"keywords": "python", "content_type": "articles"},
+            "Invalid content_type",
+        ),
+        (
+            "messaging",
+            "reply_to_conversation",
+            {"thread_id": "/feed/", "message": "Hello", "confirm_send": False},
+            "thread_id is not a LinkedIn id",
+        ),
+        (
+            "messaging",
+            "reply_to_conversation",
+            {"thread_id": "2+abc", "message": "Hello", "confirm_send": False},
+            "thread_id is not a LinkedIn id",
         ),
         (
             "messaging",
@@ -217,12 +259,14 @@ async def test_invalid_reference_is_rejected_before_extractor(
     from linkedin_mcp_server.tools.job import register_job_tools
     from linkedin_mcp_server.tools.messaging import register_messaging_tools
     from linkedin_mcp_server.tools.person import register_person_tools
+    from linkedin_mcp_server.tools.post import register_post_tools
 
     register_by_module = {
         "company": register_company_tools,
         "job": register_job_tools,
         "messaging": register_messaging_tools,
         "person": register_person_tools,
+        "post": register_post_tools,
     }
     mcp = FastMCP("test")
     register_by_module[module_name](mcp)
@@ -800,6 +844,7 @@ class TestPersonTool:
             "103644278",
             network=None,
             current_company=None,
+            connection_of=None,
         )
 
     async def test_search_people_with_network_and_company_filters(
@@ -836,6 +881,41 @@ class TestPersonTool:
             None,
             network=["F"],
             current_company="1115",
+            connection_of=None,
+        )
+
+    async def test_search_people_with_connection_of_filter(
+        self, mock_context, serve_extractor
+    ):
+        expected = {
+            "url": (
+                "https://www.linkedin.com/search/results/people/"
+                "?keywords=&network=%5B%22F%22%5D"
+                "&connectionOf=%5B%22ACoAADdZSNYBiaacxEw6je-wVIKjGkKp-it0gD8%22%5D"
+            ),
+            "sections": {"search_results": "Jane Doe\n1st"},
+        }
+        mock_extractor = _make_mock_extractor(expected)
+
+        from linkedin_mcp_server.tools.person import register_person_tools
+
+        mcp = FastMCP("test")
+        register_person_tools(mcp)
+
+        serve_extractor(mock_extractor)
+        tool_fn = await get_tool_fn(mcp, "search_people")
+        await tool_fn(
+            "",
+            mock_context,
+            network=["F"],
+            connection_of="ACoAADdZSNYBiaacxEw6je-wVIKjGkKp-it0gD8",
+        )
+        mock_extractor.search_people.assert_awaited_once_with(
+            "",
+            None,
+            network=["F"],
+            current_company=None,
+            connection_of="ACoAADdZSNYBiaacxEw6je-wVIKjGkKp-it0gD8",
         )
 
     @pytest.mark.parametrize(
@@ -898,6 +978,7 @@ class TestPersonTool:
             None,
             network=["F"],
             current_company=None,
+            connection_of=None,
         )
 
     async def test_search_people_validation_error_surfaced_as_tool_error(
