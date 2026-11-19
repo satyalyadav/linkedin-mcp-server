@@ -716,6 +716,39 @@
     "_meta": {
       "fastmcp": {
         "tags": [
+          "job"
+        ]
+      }
+    },
+    "annotations": {
+      "openWorldHint": true,
+      "readOnlyHint": true
+    },
+    "description": "List saved LinkedIn jobs with job IDs and per-job permalinks.\n\nThis is the saved-jobs list view over the same tracker page as\nget_saved_jobs, with a ready-to-use jobs array.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "max_pages": {
+          "default": 3,
+          "description": "Maximum number of tracker pages to load (1-10, default 3)",
+          "maximum": 10,
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    },
+    "name": "list_saved_jobs",
+    "outputSchema": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "title": "List Saved Jobs"
+  },
+  {
+    "_meta": {
+      "fastmcp": {
+        "tags": [
           "actions",
           "messaging"
         ]
@@ -1176,5 +1209,40 @@
       "type": "object"
     },
     "title": "Send Message"
+  },
+  {
+    "_meta": {
+      "fastmcp": {
+        "tags": [
+          "job"
+        ]
+      }
+    },
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Remove a LinkedIn job posting from the authenticated account's saved jobs list.\n\nA posting that is already unsaved is left alone and reported already_unsaved.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "job_id": {
+          "description": "LinkedIn job ID (e.g., \"4252026496\", \"3856789012\")",
+          "type": "string"
+        }
+      },
+      "required": [
+        "job_id"
+      ],
+      "type": "object"
+    },
+    "name": "unsave_job",
+    "outputSchema": {
+      "additionalProperties": true,
+      "type": "object"
+    },
+    "title": "Unsave Job"
   }
 ]

@@ -1631,13 +1631,23 @@ class TestSaveControl:
             await reader.save_control_state()
 
     async def test_click_targets_the_unsaved_label(self, mock_page):
-        """The click never takes an expected state; it only ever saves."""
+        """Saving clicks the Save label, never the Saved one."""
         reader = _reader(mock_page)
         mock_page.evaluate = AsyncMock(return_value=True)
 
         assert await reader.click_save_control() is True
         assert mock_page.evaluate.await_args_list[0].args[1] == {
-            "labels": {"saved": "Saved", "unsaved": "Save"}
+            "labels": {"saved": "Saved", "unsaved": "Save"},
+        }
+
+    async def test_unsave_click_targets_the_saved_label(self, mock_page):
+        reader = _reader(mock_page)
+        mock_page.evaluate = AsyncMock(return_value=True)
+
+        assert await reader.click_save_control(target="saved") is True
+        assert mock_page.evaluate.await_args_list[0].args[1] == {
+            "labels": {"saved": "Saved", "unsaved": "Save"},
+            "target": "saved",
         }
 
     async def test_click_reports_a_failed_evaluation(self, mock_page):
@@ -1680,7 +1690,7 @@ class TestSaveControl:
         reader = _reader(mock_page)
         mock_page.evaluate = AsyncMock(return_value="saved")
 
-        assert await reader.save_control_state(wait_for_saved=True) == "saved"
+        assert await reader.save_control_state(wait_for="saved") == "saved"
         assert mock_page.evaluate.await_args_list[0].args[1] == {
             "labels": {"saved": "Saved", "unsaved": "Save"},
             "waitTimeoutMs": job_pages_module._JOB_SAVE_CONTROL_WAIT_MS,
@@ -1692,4 +1702,4 @@ class TestSaveControl:
         reader = _reader(mock_page)
         mock_page.evaluate = AsyncMock(return_value="unsaved")
 
-        assert await reader.save_control_state(wait_for_saved=True) == "unsaved"
+        assert await reader.save_control_state(wait_for="saved") == "unsaved"

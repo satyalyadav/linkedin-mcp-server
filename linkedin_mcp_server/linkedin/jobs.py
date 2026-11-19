@@ -171,7 +171,7 @@ class JobReader:
         # the state observed afterward, not the attempt, and give the control
         # the same bounded wait to transition to saved as the initial read
         # gives it to render.
-        if await self._pages.save_control_state(wait_for_saved=True) != "saved":
+        if await self._pages.save_control_state(wait_for="saved") != "saved":
             raise LinkedInOperationError(
                 "Clicked the LinkedIn Save button, but the control did not "
                 "switch to its saved state."
@@ -182,6 +182,58 @@ class JobReader:
             "saved": True,
             "already_saved": False,
         }
+
+    async def unsave_job(self, job_id: str) -> dict[str, Any]:
+        """Remove one job posting from the account's saved jobs, idempotently."""
+        job_id = normalize_job_id(job_id)
+        url = job_view_url(job_id, "/")
+        await self._pages.open_job_posting(url)
+
+        if await self._pages.save_control_state() == "unsaved":
+            return {
+                "url": url,
+                "job_id": job_id,
+                "saved": False,
+                "already_unsaved": True,
+            }
+
+        if not await self._pages.click_save_control(target="saved"):
+            raise LinkedInOperationError(
+                "Could not find or click the LinkedIn Saved button for this job."
+            )
+
+        if await self._pages.save_control_state(wait_for="unsaved") != "unsaved":
+            raise LinkedInOperationError(
+                "Clicked the LinkedIn Saved button, but the control did not "
+                "switch to its unsaved state."
+            )
+        return {
+            "url": url,
+            "job_id": job_id,
+            "saved": False,
+            "already_unsaved": False,
+        }
+
+    async def list_saved_jobs(self, max_pages: int = 3) -> dict[str, Any]:
+        """List saved jobs with both tracker text and per-job permalinks.
+
+        This is the local list view over the same tracker page ``get_saved_jobs``
+        reads. ``jobs`` is built from the tracker's job IDs so callers can pass
+        each ID to ``get_job_details``, ``save_job`` or ``unsave_job`` without
+        parsing ``sections`` themselves.
+        """
+        result = await self.get_saved_jobs(max_pages=max_pages, stage="saved")
+        job_ids = result.get("job_ids")
+        if isinstance(job_ids, list):
+            result["jobs"] = [
+                {
+                    "job_id": job_id,
+                    "job_url": job_view_url(job_id, "/"),
+                }
+                for job_id in job_ids
+                if isinstance(job_id, str)
+            ]
+        return result
 
     async def get_job_apply_url(self, job_id: str) -> dict[str, Any]:
         """Read how a posting takes applications and where the employer's form is.

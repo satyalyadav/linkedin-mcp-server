@@ -561,6 +561,67 @@ async def _save_job_scenario(*, already_saved: bool = False) -> dict[str, Any]:
     )
 
 
+async def _unsave_job_scenario(*, already_unsaved: bool = False) -> dict[str, Any]:
+    suffix = "already_unsaved" if already_unsaved else "clicks_saved_control"
+    name = f"unsave_job__{suffix}"
+    recorder = TraceRecorder(name, _COMMON_ALLOWED)
+    clock = FakeClock(recorder)
+    page = ScriptedPage(recorder)
+    page.goto_landings.append("https://www.linkedin.com/jobs/view/123/")
+    if already_unsaved:
+        page.script("evaluate:job_save_state", "unsaved")
+    else:
+        page.script("evaluate:job_save_state", "saved", "unsaved")
+        page.script("evaluate:job_save_click", True)
+    extractor = _extractor(page)
+    async with boundaries(recorder, clock):
+        with recorder.context("unsave_job", "job"):
+            result = await extractor.unsave_job("123")
+    page.assert_clean()
+    return recorder.trace(
+        {"method": "unsave_job", "arguments": {"job_id": "123"}},
+        result,
+    )
+
+
+async def _list_saved_jobs_scenario() -> dict[str, Any]:
+    name = "list_saved_jobs__saved_tab"
+    recorder = TraceRecorder(name, _COMMON_ALLOWED)
+    clock = FakeClock(recorder)
+    page = _page(recorder)
+    page.goto_landings.append("https://www.linkedin.com/jobs-tracker/")
+    page.script(
+        "evaluate:root_content",
+        _root(
+            "Saved jobs page",
+            [
+                {
+                    "href": "https://www.linkedin.com/jobs/view/111/",
+                    "text": "Job 111",
+                    "heading": "",
+                },
+                {
+                    "href": "https://www.linkedin.com/jobs/view/222/",
+                    "text": "Job 222",
+                    "heading": "",
+                },
+            ],
+        ),
+    )
+    page.script("evaluate:saved_job_total_pages", 1)
+    page.script("evaluate:job_ids", {"ids": ["111", "222"], "scoped": False})
+    extractor = _extractor(page)
+    async with boundaries(recorder, clock):
+        with recorder.context("list_saved_jobs", "saved_jobs"):
+            result = await extractor.list_saved_jobs(max_pages=1)
+    page.assert_clean()
+    references = result.get("references", {}).get("saved_jobs", [])
+    return recorder.trace(
+        {"method": "list_saved_jobs", "arguments": {"max_pages": 1}},
+        _complete_mapping_result(result, reference_count=len(references)),
+    )
+
+
 async def _feed_stale_scenario() -> dict[str, Any]:
     name = "extract_feed__stale_stop"
     recorder = TraceRecorder(name, _COMMON_ALLOWED)
@@ -1296,7 +1357,9 @@ TOOL_FACADE_METHODS = {
     "get_job_apply_url",
     "get_my_profile",
     "get_saved_jobs",
+    "list_saved_jobs",
     "save_job",
+    "unsave_job",
     "get_sidebar_profiles",
     "read_company",
     "read_job",
@@ -1341,6 +1404,11 @@ async def build_policy_traces() -> dict[str, dict[str, Any]]:
         "saved-jobs.json": await _saved_jobs_scenario(),
         "save-job.json": await _save_job_scenario(),
         "save-job-already-saved.json": await _save_job_scenario(already_saved=True),
+        "unsave-job.json": await _unsave_job_scenario(),
+        "unsave-job-already-unsaved.json": await _unsave_job_scenario(
+            already_unsaved=True
+        ),
+        "list-saved-jobs.json": await _list_saved_jobs_scenario(),
         "dismiss-job.json": await _dismiss_job_scenario(),
         "feed-stale.json": await _feed_stale_scenario(),
         "feed-response-success.json": await _feed_response_scenario(body_failure=False),

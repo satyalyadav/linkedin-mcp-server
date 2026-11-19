@@ -282,16 +282,19 @@ _JOB_SAVE_STATE_JS = (
 }"""
 )
 
-# Revalidate both labels, then click only if the sole control is still unsaved.
+# Revalidate both labels, then click only if the sole control is still in the
+# state the action expects. `target` is the label the control must currently
+# show: unsaved for Save, saved for Unsave.
 _JOB_SAVE_CLICK_JS = (
-    r"""({ labels }) => {
+    r"""({ labels, target = 'unsaved' }) => {
 """
     + _JOB_SAVE_SCAN_JS
     + r"""
     const controls = matchingControls([labels.saved, labels.unsaved]);
     if (controls.length !== 1) return false;
     const text = normalize(controls[0].innerText || controls[0].textContent);
-    if (text !== labels.unsaved) return false;
+    const expected = target === 'saved' ? labels.saved : labels.unsaved;
+    if (text !== expected) return false;
     controls[0].click();
     return true;
 }"""
@@ -760,21 +763,21 @@ class JobPageReader:
         await self._session.dismiss_modal()
 
     async def save_control_state(
-        self, *, wait_for_saved: bool = False
+        self, *, wait_for: Literal["saved", "unsaved"] | None = None
     ) -> Literal["saved", "unsaved"]:
-        """Read the unique save control, waiting for the saved transition when asked.
+        """Read the unique save control, waiting for a transition when asked.
 
         The forced en-US labels are the only detection signal. The wait covers
-        a control that renders late; `wait_for_saved` keeps waiting on an
-        unchanged unsaved control instead of reading it back at once. A
-        missing or ambiguous control fails closed.
+        a control that renders late; `wait_for` keeps waiting on a control
+        that has not reached the expected state instead of reading it back at
+        once. A missing or ambiguous control fails closed.
         """
         options: dict[str, object] = {
             "labels": _JOB_SAVE_LABELS,
             "waitTimeoutMs": _JOB_SAVE_CONTROL_WAIT_MS,
         }
-        if wait_for_saved:
-            options["target"] = "saved"
+        if wait_for is not None:
+            options["target"] = wait_for
         state = await self._session.run_on_linkedin(_JOB_SAVE_STATE_JS, options)
         if state not in {"saved", "unsaved"}:
             await self._navigator._raise_if_auth_barrier(self._session.page.url)
@@ -783,20 +786,22 @@ class JobPageReader:
             )
         return state
 
-    async def click_save_control(self) -> bool:
-        """Click the unique unsaved control, and nothing else.
+    async def click_save_control(
+        self, *, target: Literal["saved", "unsaved"] = "unsaved"
+    ) -> bool:
+        """Click the unique control showing ``target``, and nothing else.
 
-        Saving is the only action this control is ever clicked for, so the
-        click never targets the Saved label. Uniqueness is revalidated inside
-        the program, so a control count that changed since the state read
-        dispatches nothing.
+        Saving clicks the unsaved control; unsaving clicks the saved one. The
+        click refuses if the control already moved to the other label.
+        Uniqueness is revalidated inside the program, so a control count that
+        changed since the state read dispatches nothing.
         """
+        options: dict[str, object] = {"labels": _JOB_SAVE_LABELS}
+        if target != "unsaved":
+            options["target"] = target
         try:
             clicked = bool(
-                await self._session.run_on_linkedin(
-                    _JOB_SAVE_CLICK_JS,
-                    {"labels": _JOB_SAVE_LABELS},
-                )
+                await self._session.run_on_linkedin(_JOB_SAVE_CLICK_JS, options)
             )
         except LinkedInOperationError:
             # A redirect off LinkedIn, or another operation failure, must reach

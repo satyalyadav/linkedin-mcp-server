@@ -47,7 +47,7 @@ instances, clear profiles, or replace the user's browser session.
   `get_sidebar_profiles`.
 - Companies: `get_company_profile`, `get_company_posts`, `search_companies`,
   and `get_company_employees`.
-- Jobs: `search_jobs`, `get_saved_jobs`, `get_job_details`,
+- Jobs: `search_jobs`, `get_saved_jobs`, `list_saved_jobs`, `get_job_details`,
   `get_job_apply_url` and `get_easy_apply_form`. `get_easy_apply_form` opens
   the Easy Apply form, so use it only when the user is preparing an
   application.
@@ -55,8 +55,8 @@ instances, clear profiles, or replace the user's browser session.
 - Messages: `get_inbox`, `get_conversation`, and `search_conversations`.
 - Writes: `send_message`, `reply_to_conversation` (answer an existing thread,
   InMail included), `connect_with_person`, `archive_conversation`,
-  `dismiss_job` and `save_job`, subject to the explicit authorization rules
-  above.
+  `dismiss_job`, `save_job` and `unsave_job`, subject to the explicit
+  authorization rules above.
 - Session: `get_session_status` says whether a login is saved without opening
   a browser or a login window; it does not prove LinkedIn still accepts it.
 - Cleanup: use `close_session` only when the user asks to end the managed

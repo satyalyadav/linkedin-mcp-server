@@ -206,6 +206,47 @@ class TestJobSaveClickJs:
         )
         assert state is True
 
+    async def test_click_dispatches_on_the_saved_label_for_unsave(self, dom_page):
+        await dom_page.set_content(_page_html(SAVED_CARD))
+        await dom_page.evaluate(
+            """({ labels }) => {
+                const normalize = value => (value || '').replace(/\\s+/g, ' ').trim();
+                const target = Array.from(
+                    document.querySelectorAll('main button')
+                ).find(
+                    element =>
+                        normalize(element.innerText || element.textContent) ===
+                        labels.saved
+                );
+                if (!target) throw new Error('Expected Saved control was not found');
+                target.addEventListener('click', () => {
+                    target.dataset.clicked = 'true';
+                });
+            }""",
+            {"labels": LABELS},
+        )
+        clicked = await dom_page.evaluate(
+            _JOB_SAVE_CLICK_JS, {"labels": LABELS, "target": "saved"}
+        )
+        assert clicked is True
+        state = await dom_page.evaluate(
+            """() => {
+                const buttons = document.querySelectorAll('main button');
+                return Array.from(buttons).some((b) => b.dataset.clicked);
+            }"""
+        )
+        assert state is True
+
+    async def test_click_refuses_when_the_target_label_is_absent(self, dom_page):
+        """Unsave must not click Save, and Save must not click Saved."""
+        await dom_page.set_content(_page_html(UNSAVED_CARD))
+        assert (
+            await dom_page.evaluate(
+                _JOB_SAVE_CLICK_JS, {"labels": LABELS, "target": "saved"}
+            )
+            is False
+        )
+
     @pytest.mark.parametrize(
         "card",
         [
@@ -374,7 +415,7 @@ class TestJobSaveTransitionOnPosting:
         # deadline turns an unbounded-wait regression into a test failure.
         assert (
             await asyncio.wait_for(
-                reader.save_control_state(wait_for_saved=True), timeout=5
+                reader.save_control_state(wait_for="saved"), timeout=5
             )
             == "saved"
         )
@@ -394,7 +435,7 @@ class TestJobSaveTransitionOnPosting:
         # regression ignored the setting and waited the full default instead.
         assert (
             await asyncio.wait_for(
-                reader.save_control_state(wait_for_saved=True), timeout=2
+                reader.save_control_state(wait_for="saved"), timeout=2
             )
             == "unsaved"
         )
@@ -405,5 +446,5 @@ class TestJobSaveTransitionOnPosting:
         reader = await _reader_on_posting(dom_page, url, _page_html(AMBIGUOUS_CARD))
         with pytest.raises(LinkedInOperationError, match="Could not uniquely identify"):
             await asyncio.wait_for(
-                reader.save_control_state(wait_for_saved=True), timeout=2
+                reader.save_control_state(wait_for="saved"), timeout=2
             )

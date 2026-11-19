@@ -35,6 +35,8 @@ def _make_mock_extractor(result: dict) -> MagicMock:
     mock.read_job = AsyncMock(return_value=result)
     mock.search_jobs = AsyncMock(return_value=result)
     mock.save_job = AsyncMock(return_value=result)
+    mock.unsave_job = AsyncMock(return_value=result)
+    mock.list_saved_jobs = AsyncMock(return_value=result)
     mock.get_saved_jobs = AsyncMock(return_value=result)
     mock.get_job_apply_url = AsyncMock(return_value=result)
     mock.dismiss_job = AsyncMock(return_value=result)
@@ -250,7 +252,9 @@ _A_VALID_CALL = [
     ("job", "get_job_apply_url", {"job_id": "4252026496"}),
     ("job", "search_jobs", {"keywords": "python"}),
     ("job", "get_saved_jobs", {}),
+    ("job", "list_saved_jobs", {}),
     ("job", "save_job", {"job_id": "4252026496"}),
+    ("job", "unsave_job", {"job_id": "4252026496"}),
     ("job", "dismiss_job", {"job_id": "4252026496"}),
     ("job", "get_easy_apply_form", {"job_id": "4252026496"}),
     ("messaging", "get_inbox", {}),
@@ -1625,6 +1629,74 @@ class TestJobTools:
 
         assert result == expected
         mock_extractor.save_job.assert_awaited_once_with("12345")
+
+    @pytest.mark.parametrize(
+        "already_unsaved", [False, True], ids=["newly-unsaved", "already-unsaved"]
+    )
+    async def test_unsave_job(self, mock_context, serve_extractor, already_unsaved):
+        expected = {
+            "url": "https://www.linkedin.com/jobs/view/12345/",
+            "job_id": "12345",
+            "saved": False,
+            "already_unsaved": already_unsaved,
+        }
+        mock_extractor = _make_mock_extractor(dict(expected))
+
+        from linkedin_mcp_server.tools.job import register_job_tools
+
+        mcp = FastMCP("test")
+        register_job_tools(mcp)
+
+        tool = await mcp.get_tool("unsave_job")
+        assert tool is not None
+        assert tool.tags == {"job"}
+        assert tool.annotations is not None
+        assert tool.annotations.read_only_hint is False
+        assert tool.annotations.destructive_hint is True
+        assert tool.annotations.idempotent_hint is True
+
+        serve_extractor(mock_extractor)
+        tool_fn = await get_tool_fn(mcp, "unsave_job")
+        result = await tool_fn("12345", mock_context)
+
+        assert result == expected
+        mock_extractor.unsave_job.assert_awaited_once_with("12345")
+
+    async def test_list_saved_jobs(self, mock_context, serve_extractor):
+        expected = {
+            "url": "https://www.linkedin.com/jobs-tracker/?stage=saved",
+            "sections": {"saved_jobs": "Saved Job 1\nSaved Job 2"},
+            "job_ids": ["111", "222"],
+            "jobs": [
+                {
+                    "job_id": "111",
+                    "job_url": "https://www.linkedin.com/jobs/view/111/",
+                },
+                {
+                    "job_id": "222",
+                    "job_url": "https://www.linkedin.com/jobs/view/222/",
+                },
+            ],
+        }
+        mock_extractor = _make_mock_extractor(dict(expected))
+
+        from linkedin_mcp_server.tools.job import register_job_tools
+
+        mcp = FastMCP("test")
+        register_job_tools(mcp)
+
+        tool = await mcp.get_tool("list_saved_jobs")
+        assert tool is not None
+        assert tool.tags == {"job"}
+        assert tool.annotations is not None
+        assert tool.annotations.read_only_hint is True
+
+        serve_extractor(mock_extractor)
+        tool_fn = await get_tool_fn(mcp, "list_saved_jobs")
+        result = await tool_fn(mock_context, max_pages=2)
+
+        assert result == expected
+        mock_extractor.list_saved_jobs.assert_awaited_once_with(max_pages=2)
 
 
 class TestGetSidebarProfilesTool:

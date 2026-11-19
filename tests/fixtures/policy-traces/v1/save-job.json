@@ -97,7 +97,7 @@
       "call": "save_job",
       "kind": "evaluate",
       "operation": "job_save_click",
-      "program_digest": "9f3a8227616f",
+      "program_digest": "d4b29cf1cf89",
       "section": "job"
     },
     {

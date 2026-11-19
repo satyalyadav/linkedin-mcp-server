@@ -1,0 +1,128 @@
+{
+  "call": {
+    "arguments": {
+      "job_id": "123"
+    },
+    "method": "unsave_job"
+  },
+  "events": [
+    {
+      "call": "unsave_job",
+      "callback_id": "callback-1",
+      "event": "framenavigated",
+      "kind": "listener.add",
+      "section": "job"
+    },
+    {
+      "call": "unsave_job",
+      "extra": {
+        "target_url": "https://www.linkedin.com/jobs/view/123/",
+        "wait_until": "domcontentloaded"
+      },
+      "kind": "boundary.trace",
+      "label": "extractor-before-goto",
+      "section": "job"
+    },
+    {
+      "call": "unsave_job",
+      "kind": "navigate",
+      "landed_url": "https://www.linkedin.com/jobs/view/123/",
+      "requested_url": "https://www.linkedin.com/jobs/view/123/",
+      "section": "job",
+      "timeout_ms": 30000,
+      "wait_until": "domcontentloaded"
+    },
+    {
+      "call": "unsave_job",
+      "description": "goto https://www.linkedin.com/jobs/view/123/",
+      "kind": "boundary.stabilize",
+      "result": null,
+      "section": "job"
+    },
+    {
+      "call": "unsave_job",
+      "extra": {
+        "target_url": "https://www.linkedin.com/jobs/view/123/",
+        "wait_until": "domcontentloaded"
+      },
+      "kind": "boundary.trace",
+      "label": "extractor-after-goto",
+      "section": "job"
+    },
+    {
+      "call": "unsave_job",
+      "kind": "boundary.auth_quick",
+      "result": null,
+      "section": "job"
+    },
+    {
+      "call": "unsave_job",
+      "callback_id": "callback-1",
+      "event": "framenavigated",
+      "kind": "listener.remove",
+      "section": "job"
+    },
+    {
+      "call": "unsave_job",
+      "kind": "boundary.rate_limit",
+      "section": "job"
+    },
+    {
+      "call": "unsave_job",
+      "dismissed": false,
+      "kind": "boundary.modal",
+      "section": "job"
+    },
+    {
+      "arg": {
+        "labels": {
+          "saved": "Saved",
+          "unsaved": "Save"
+        },
+        "waitTimeoutMs": 10000
+      },
+      "call": "unsave_job",
+      "kind": "evaluate",
+      "operation": "job_save_state",
+      "program_digest": "16051ec502ff",
+      "section": "job"
+    },
+    {
+      "arg": {
+        "labels": {
+          "saved": "Saved",
+          "unsaved": "Save"
+        },
+        "target": "saved"
+      },
+      "call": "unsave_job",
+      "kind": "evaluate",
+      "operation": "job_save_click",
+      "program_digest": "d4b29cf1cf89",
+      "section": "job"
+    },
+    {
+      "arg": {
+        "labels": {
+          "saved": "Saved",
+          "unsaved": "Save"
+        },
+        "target": "unsaved",
+        "waitTimeoutMs": 10000
+      },
+      "call": "unsave_job",
+      "kind": "evaluate",
+      "operation": "job_save_state",
+      "program_digest": "16051ec502ff",
+      "section": "job"
+    }
+  ],
+  "result": {
+    "already_unsaved": false,
+    "job_id": "123",
+    "saved": false,
+    "url": "https://www.linkedin.com/jobs/view/123/"
+  },
+  "scenario": "unsave_job__clicks_saved_control",
+  "schema_version": 1
+}

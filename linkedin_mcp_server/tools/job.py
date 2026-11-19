@@ -289,6 +289,81 @@ def register_job_tools(
 
     @mcp.tool(
         timeout=tool_timeout,
+        title="Unsave Job",
+        annotations={
+            "readOnlyHint": False,
+            "destructiveHint": True,
+            "idempotentHint": True,
+            "openWorldHint": True,
+        },
+        tags={"job"},
+    )
+    @tool_errors
+    async def unsave_job(
+        job_id: str,
+        ctx: Context,
+    ) -> dict[str, Any]:
+        """
+        Remove a LinkedIn job posting from the authenticated account's saved jobs list.
+
+        A posting that is already unsaved is left alone and reported already_unsaved.
+
+        Args:
+            job_id: LinkedIn job ID (e.g., "4252026496", "3856789012")
+            ctx: FastMCP context for progress reporting
+
+        Returns:
+            Dict with url, job_id, saved, and already_unsaved status.
+        """
+        extractor = await get_ready_extractor(ctx, tool_name="unsave_job")
+        logger.info("Unsaving job: %s", job_id)
+
+        await ctx.report_progress(progress=0, total=100, message="Opening job")
+
+        result = await extractor.unsave_job(job_id)
+
+        await ctx.report_progress(progress=100, total=100, message="Complete")
+
+        return result
+
+    @mcp.tool(
+        timeout=tool_timeout,
+        title="List Saved Jobs",
+        annotations={"readOnlyHint": True, "openWorldHint": True},
+        tags={"job"},
+    )
+    @tool_errors
+    async def list_saved_jobs(
+        ctx: Context,
+        max_pages: Annotated[int, Field(ge=1, le=10)] = 3,
+    ) -> dict[str, Any]:
+        """
+        List saved LinkedIn jobs with job IDs and per-job permalinks.
+
+        This is the saved-jobs list view over the same tracker page as
+        get_saved_jobs, with a ready-to-use jobs array.
+
+        Args:
+            ctx: FastMCP context for progress reporting
+            max_pages: Maximum number of tracker pages to load (1-10, default 3)
+
+        Returns:
+            Dict with url, sections, job_ids, and jobs:
+            [{job_id, job_url}] in tracker order.
+        """
+        extractor = await get_ready_extractor(ctx, tool_name="list_saved_jobs")
+        logger.info("Listing saved jobs (max_pages=%d)", max_pages)
+
+        await ctx.report_progress(progress=0, total=100, message="Loading saved jobs")
+
+        result = await extractor.list_saved_jobs(max_pages=max_pages)
+
+        await ctx.report_progress(progress=100, total=100, message="Complete")
+
+        return result
+
+    @mcp.tool(
+        timeout=tool_timeout,
         title="Get Saved Jobs",
         annotations={"readOnlyHint": True, "openWorldHint": True},
         tags={"job"},

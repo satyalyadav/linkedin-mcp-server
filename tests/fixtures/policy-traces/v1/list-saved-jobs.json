@@ -1,0 +1,191 @@
+{
+  "call": {
+    "arguments": {
+      "max_pages": 1
+    },
+    "method": "list_saved_jobs"
+  },
+  "events": [
+    {
+      "call": "list_saved_jobs",
+      "callback_id": "callback-1",
+      "event": "framenavigated",
+      "kind": "listener.add",
+      "section": "saved_jobs"
+    },
+    {
+      "call": "list_saved_jobs",
+      "callback_id": "callback-2",
+      "event": "framenavigated",
+      "kind": "listener.add",
+      "section": "saved_jobs"
+    },
+    {
+      "call": "list_saved_jobs",
+      "extra": {
+        "target_url": "https://www.linkedin.com/jobs-tracker/?stage=saved",
+        "wait_until": "domcontentloaded"
+      },
+      "kind": "boundary.trace",
+      "label": "extractor-before-goto",
+      "section": "saved_jobs"
+    },
+    {
+      "call": "list_saved_jobs",
+      "kind": "navigate",
+      "landed_url": "https://www.linkedin.com/jobs-tracker/",
+      "requested_url": "https://www.linkedin.com/jobs-tracker/?stage=saved",
+      "section": "saved_jobs",
+      "timeout_ms": 30000,
+      "wait_until": "domcontentloaded"
+    },
+    {
+      "call": "list_saved_jobs",
+      "description": "goto https://www.linkedin.com/jobs-tracker/?stage=saved",
+      "kind": "boundary.stabilize",
+      "result": null,
+      "section": "saved_jobs"
+    },
+    {
+      "call": "list_saved_jobs",
+      "extra": {
+        "target_url": "https://www.linkedin.com/jobs-tracker/?stage=saved",
+        "wait_until": "domcontentloaded"
+      },
+      "kind": "boundary.trace",
+      "label": "extractor-after-goto",
+      "section": "saved_jobs"
+    },
+    {
+      "call": "list_saved_jobs",
+      "kind": "boundary.auth_quick",
+      "result": null,
+      "section": "saved_jobs"
+    },
+    {
+      "call": "list_saved_jobs",
+      "callback_id": "callback-2",
+      "event": "framenavigated",
+      "kind": "listener.remove",
+      "section": "saved_jobs"
+    },
+    {
+      "call": "list_saved_jobs",
+      "kind": "boundary.rate_limit",
+      "section": "saved_jobs"
+    },
+    {
+      "call": "list_saved_jobs",
+      "kind": "evaluate",
+      "operation": "document_origin",
+      "program_digest": "695b5d466ef7",
+      "section": "saved_jobs"
+    },
+    {
+      "call": "list_saved_jobs",
+      "kind": "wait_for_selector",
+      "operation": "main",
+      "section": "saved_jobs",
+      "selector": "main",
+      "state": "visible",
+      "timeout_ms": null
+    },
+    {
+      "call": "list_saved_jobs",
+      "dismissed": false,
+      "kind": "boundary.modal",
+      "section": "saved_jobs"
+    },
+    {
+      "actual_scrolls": 2,
+      "call": "list_saved_jobs",
+      "kind": "boundary.scroll_body",
+      "max_scrolls": 5,
+      "pause_time": 0.5,
+      "section": "saved_jobs"
+    },
+    {
+      "arg": {
+        "selectors": [
+          "main"
+        ]
+      },
+      "call": "list_saved_jobs",
+      "kind": "evaluate",
+      "operation": "root_content",
+      "program_digest": "e6b2be4ebddd",
+      "section": "saved_jobs"
+    },
+    {
+      "call": "list_saved_jobs",
+      "kind": "evaluate",
+      "operation": "document_origin",
+      "program_digest": "695b5d466ef7",
+      "section": "saved_jobs"
+    },
+    {
+      "call": "list_saved_jobs",
+      "callback_id": "callback-1",
+      "event": "framenavigated",
+      "kind": "listener.remove",
+      "section": "saved_jobs"
+    },
+    {
+      "call": "list_saved_jobs",
+      "kind": "evaluate",
+      "operation": "saved_job_total_pages",
+      "program_digest": "1e381f482b68",
+      "section": "saved_jobs"
+    },
+    {
+      "arg": {
+        "scoped": false,
+        "selector": "a[href*=\"/jobs/view/\"], [componentkey^=\"job-card-component-ref-\"]"
+      },
+      "call": "list_saved_jobs",
+      "kind": "evaluate",
+      "operation": "job_ids",
+      "program_digest": "74cc40cf81cb",
+      "section": "saved_jobs"
+    }
+  ],
+  "result": {
+    "job_ids": [
+      "111",
+      "222"
+    ],
+    "jobs": [
+      {
+        "job_id": "111",
+        "job_url": "https://www.linkedin.com/jobs/view/111/"
+      },
+      {
+        "job_id": "222",
+        "job_url": "https://www.linkedin.com/jobs/view/222/"
+      }
+    ],
+    "reference_count": 2,
+    "references": {
+      "saved_jobs": [
+        {
+          "context": "saved jobs",
+          "kind": "job",
+          "text": "Job 111",
+          "url": "/jobs/view/111/"
+        },
+        {
+          "context": "saved jobs",
+          "kind": "job",
+          "text": "Job 222",
+          "url": "/jobs/view/222/"
+        }
+      ]
+    },
+    "sections": {
+      "saved_jobs": "Saved jobs page"
+    },
+    "url": "https://www.linkedin.com/jobs-tracker/?stage=saved"
+  },
+  "scenario": "list_saved_jobs__saved_tab",
+  "schema_version": 1
+}
